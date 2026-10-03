@@ -1,0 +1,151 @@
+# Generic defaults. A deployment is this file plus two overlays:
+#   values/fleet.yaml            the catalogue: models and sites, the same on every cluster
+#   values/sites/<cluster>.yaml  this cluster's gateway, peer listener, certificates and
+#                                global name (the same file the model chart reads)
+
+# The catalogue (values/fleet.yaml).
+#
+# Every model served anywhere in the fleet. A route is rendered for each on every
+# cluster; a site that does not serve a model fails that model's health check and
+# gets none of its traffic, so the list says WHAT is served, not WHERE.
+#   - name: glm-5.3            # what clients send as "model" (x-ai-eg-model)
+#     id: ""                   # resource-name form; default: name with [^a-z0-9-] -> "-"
+#     healthPath: ""           # default /healthz/<name> (the model release's healthRoute)
+#     hashHeader: ""           # consistent hashing on this request header; empty = least-request
+#     requestTimeout: ""       # default fleet.defaults.requestTimeout
+#     llmRequestCosts: []      # default fleet.defaults.llmRequestCosts
+#     rateLimit: {}            # merged over fleet.defaults.rateLimit
+# Rule: a model runs on one hardware type (one recipe). Health checks would
+# happily pool a model across sites whose recipes differ, and a request that fits
+# one site's max-model-len can then fail on another.
+models: []
+
+# Every site in the fleet. address must be a hostname: an IP among hostnames
+# makes Envoy Gateway split the cluster per site, and least-request, hashing and
+# cross-site retry stop working. port defaults to crossSite.port.
+#   - {name: site1, address: llm.site1.example.internal}
+sites: []
+
+# --- per cluster (values/sites/<cluster>.yaml, shared with the model chart) -----
+
+route:
+  gateway:
+    # The Agent Router Gateway. sectionName is the client listener and is
+    # required: without it the tier-0 routes also attach to the peer listener.
+    name: ai-gateway
+    namespace: ai-gateway
+    sectionName: ""
+
+crossSite:
+  # sectionName of the peer-only mTLS listener the model releases' serving
+  # routes sit on. Not created by any chart (see fleet/README.md).
+  peerListener: ""
+  # Default port for sites[].port.
+  port: 8443
+  # Requests carrying this header with a site name go to that site only. The
+  # model chart's benchmark hook sets it to its own site.
+  pinHeader: x-site-pin
+  tls:
+    # SNI and health-check Host sent to every site; each peer listener's
+    # certificate must cover it. Default: globalName.fqdn.
+    hostname: ""
+    # CA that signed the peer listeners' certificates (key ca.crt), in the
+    # release namespace.
+    caCertificateRef:
+      kind: ConfigMap
+      name: ""
+    # kubernetes.io/tls Secret in the release namespace, presented to peers.
+    clientCertificateSecret: ""
+
+# --- tier-0 behaviour --------------------------------------------------------
+
+fleet:
+  retry:
+    # Attempts after the first, each to a different site, only before the
+    # response starts (a 503 shed, connect failure or reset). Empty = len(sites)-1,
+    # so a request reaches every site before failing.
+    numRetries: null
+    baseInterval: 100ms
+    maxInterval: 1s
+  # Membership: a site is in a model's pool while GET <healthPath> through its
+  # peer listener answers 200. A dead site, or one without the model, is out
+  # within interval x unhealthyThreshold.
+  healthCheck:
+    interval: 5s
+    timeout: 3s
+    unhealthyThreshold: 3
+    healthyThreshold: 2
+  # Circuit breaker per Envoy replica, per model, across all sites. Envoy's
+  # default (1024) would cap the fleet; the real limit is each site's shed point.
+  maxParallelRequests: 100000
+  defaults:
+    # The Envoy default is 60s, which kills long reasoning.
+    requestTimeout: 3600s
+    llmRequestCosts:
+      - {metadataKey: llm_input_token, type: InputToken}
+      - {metadataKey: llm_output_token, type: OutputToken}
+      - {metadataKey: llm_reasoning_token, type: ReasoningToken}
+      - {metadataKey: llm_total_token, type: TotalToken}
+    # Per-client token budget per model, charged once at the entry site. Needs
+    # the Envoy Gateway rate limit service; point every cluster's at one
+    # Redis/Valkey for fleet-wide budgets. Fails open: a limiter outage lapses
+    # budgets, it never stops inference. Never set failClosed.
+    rateLimit:
+      enabled: false
+      # Written by the gateway from the verified credential, stripped from
+      # client input; otherwise anyone can pick another tenant's budget.
+      clientHeader: x-tenant-id
+      tokens: 2000000
+      unit: Hour
+      costKey: llm_total_token
+      extraRules: []
+  # 200 at this path on the client listener while the gateway is up: the Avi
+  # GSLB monitor. Any gateway can proxy any model, so GSLB monitors the gateway,
+  # not a model.
+  gatewayHealth:
+    enabled: true
+    path: /healthz/gateway
+
+argocd:
+  enabled: false
+  syncWaves:
+    policy: 1
+    route: 2
+
+globalName:
+  # One name in front of every site (AKO + AMKO). Describes the gateway: only
+  # this release creates it.
+  enabled: false
+  # The same on every site, e.g. llm.example.internal
+  fqdn: ""
+
+  hostRule:
+    # AKO HostRule mapping this cluster's gateway FQDN to the global FQDN.
+    # Needed on every cluster when AMKO runs in custom global FQDN mode
+    # (GSLBConfig useCustomGlobalFqdn: true). In default mode AMKO groups
+    # Services by identical hostname instead; set create: false.
+    create: true
+    apiVersion: ako.vmware.com/v1beta1
+    # Namespace of the gateway's LoadBalancer Service on this cluster.
+    namespace: ""
+    # The FQDN AKO assigned to that Service on this cluster.
+    localFqdn: ""
+
+  gslbHostRule:
+    # Create on the AMKO leader cluster only; AMKO pushes the GslbService to
+    # the Avi GSLB sites itself.
+    create: false
+    apiVersion: amko.vmware.com/v1alpha1
+    namespace: avi-system
+    # Clients re-resolve this often. Open connections are not affected, so a
+    # low TTL only speeds up failover.
+    ttl: 30
+    # Federated HTTPS monitors on the Avi controller. Use one that requests
+    # fleet.gatewayHealth.path and expects 200; the default L4 monitor only
+    # proves the port is open.
+    healthMonitorRefs: []
+    # Tier 0 makes routing decisions; GSLB only spreads entry. Round robin.
+    poolAlgorithmSettings:
+      lbAlgorithm: GSLB_ALGORITHM_ROUND_ROBIN
+    # Optional per-cluster {cluster, weight (1-20), priority}.
+    trafficSplit: []

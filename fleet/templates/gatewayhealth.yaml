@@ -1,0 +1,57 @@
+{{- /*
+GET <fleet.gatewayHealth.path> on the client listener answers 200 from Envoy
+itself, for the Avi GSLB monitor. Any gateway can proxy any model, so GSLB
+monitors the gateway; per-model health is tier 0's job.
+*/ -}}
+{{- if .Values.fleet.gatewayHealth.enabled }}
+{{- $cfg := include "fleet.config" . | fromYaml -}}
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: HTTPRouteFilter
+metadata:
+  name: {{ .Release.Name }}-gateway-health
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fleet.labels" . | nindent 4 }}
+  {{- with include "fleet.annotations" (dict "root" . "wave" "policy") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  directResponse:
+    statusCode: 200
+    contentType: text/plain
+    body:
+      type: Inline
+      inline: "ok\n"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ .Release.Name }}-gateway-health
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fleet.labels" . | nindent 4 }}
+  {{- with include "fleet.annotations" (dict "root" . "wave" "route") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ .Values.route.gateway.name }}
+      namespace: {{ .Values.route.gateway.namespace }}
+      sectionName: {{ $cfg.clientListener }}
+  rules:
+    - matches:
+        - method: GET
+          path:
+            type: Exact
+            value: {{ .Values.fleet.gatewayHealth.path }}
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.envoyproxy.io
+            kind: HTTPRouteFilter
+            name: {{ .Release.Name }}-gateway-health
+{{- end }}

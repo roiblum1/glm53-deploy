@@ -1,0 +1,17 @@
+# The fleet catalogue: identical on every cluster. Installed with the cluster's
+# site file:  helm template fleet fleet -f values/fleet.yaml -f values/sites/<cluster>.yaml
+#
+# models: everything served anywhere. Where a model runs is NOT listed: tier 0
+# health-checks every site for every model and pools the ones that answer.
+# name must equal the model release's model.name. One hardware type per model.
+models:
+  - name: glm-5.3              # GLM-5.3 FP4, B200
+  - name: kimi-k2.7            # Kimi K2.7, H200
+  - name: qwen3.8-27b          # Qwen3.8 27B
+
+# sites: every cluster with an Agent Router gateway. Hostnames only.
+sites:
+  - {name: site1, address: llm.site1.example.internal}
+  - {name: site2, address: llm.site2.example.internal}
+  - {name: site3, address: llm.site3.example.internal}
+  - {name: site4, address: llm.site4.example.internal}

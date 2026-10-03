@@ -8,17 +8,13 @@ global FQDN into one GslbService.
 GSLBHostRule (AMKO leader cluster only): the per-name settings of that
 GslbService: health monitors, algorithm, TTL, per-site weights.
 
-Both describe the gateway, not the model, so only one release per cluster may
-create them. The GlobalDeploymentPolicy is a singleton per AMKO and is not
+Both describe the gateway, not a model: the fleet release owns them. The GlobalDeploymentPolicy is a singleton per AMKO and is not
 created here; it must select the gateway's LoadBalancer Service.
 */ -}}
 {{- if .Values.globalName.enabled }}
-{{- $fullname := include "kserve-llm.fullname" . -}}
+{{- $fullname := .Release.Name -}}
 {{- $global := .Values.globalName -}}
 {{- $fqdn := required "globalName.fqdn is required" $global.fqdn -}}
-{{- if and .Values.benchmark.enabled (contains $fqdn .Values.benchmark.url) }}
-{{- fail (printf "benchmark.url %q uses the global name; it must be this site's own gateway" .Values.benchmark.url) }}
-{{- end }}
 {{- if $global.hostRule.create }}
 apiVersion: {{ $global.hostRule.apiVersion }}
 kind: HostRule
@@ -26,8 +22,8 @@ metadata:
   name: {{ $fullname }}-global-name
   namespace: {{ required "globalName.hostRule.namespace is required (namespace of the gateway's LoadBalancer Service)" $global.hostRule.namespace }}
   labels:
-    {{- include "kserve-llm.labels" . | nindent 4 }}
-  {{- with include "kserve-llm.annotations" (dict "root" . "wave" "route") }}
+    {{- include "fleet.labels" . | nindent 4 }}
+  {{- with include "fleet.annotations" (dict "root" . "wave" "route") }}
   annotations:
     {{- . | nindent 4 }}
   {{- end }}
@@ -45,8 +41,8 @@ metadata:
   name: {{ $fullname }}-global-name
   namespace: {{ $global.gslbHostRule.namespace }}
   labels:
-    {{- include "kserve-llm.labels" . | nindent 4 }}
-  {{- with include "kserve-llm.annotations" (dict "root" . "wave" "route") }}
+    {{- include "fleet.labels" . | nindent 4 }}
+  {{- with include "fleet.annotations" (dict "root" . "wave" "route") }}
   annotations:
     {{- . | nindent 4 }}
   {{- end }}

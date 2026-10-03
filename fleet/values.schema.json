@@ -1,0 +1,299 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+          },
+          "healthPath": {
+            "type": "string",
+            "pattern": "^/"
+          },
+          "hashHeader": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9-]*$"
+          },
+          "requestTimeout": {
+            "type": "string",
+            "pattern": "^[0-9]+(ms|s|m|h)$"
+          },
+          "llmRequestCosts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "metadataKey",
+                "type"
+              ]
+            }
+          },
+          "rateLimit": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "clientHeader": {
+                "type": "string"
+              },
+              "tokens": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "unit": {
+                "enum": [
+                  "Second",
+                  "Minute",
+                  "Hour",
+                  "Day"
+                ]
+              },
+              "costKey": {
+                "type": "string"
+              },
+              "extraRules": {
+                "type": "array"
+              }
+            }
+          }
+        }
+      }
+    },
+    "sites": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "address"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+          },
+          "address": {
+            "type": "string",
+            "minLength": 1
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "properties": {
+        "gateway": {
+          "type": "object",
+          "required": [
+            "name",
+            "namespace"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "namespace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sectionName": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "crossSite": {
+      "type": "object",
+      "properties": {
+        "peerListener": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "pinHeader": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+$"
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "hostname": {
+              "type": "string"
+            },
+            "caCertificateRef": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "ConfigMap",
+                    "Secret"
+                  ]
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            },
+            "clientCertificateSecret": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "fleet": {
+      "type": "object",
+      "properties": {
+        "retry": {
+          "type": "object",
+          "properties": {
+            "numRetries": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "baseInterval": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$"
+            },
+            "maxInterval": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$"
+            }
+          }
+        },
+        "healthCheck": {
+          "type": "object",
+          "properties": {
+            "interval": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$"
+            },
+            "timeout": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$"
+            },
+            "unhealthyThreshold": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "healthyThreshold": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "maxParallelRequests": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "defaults": {
+          "type": "object",
+          "properties": {
+            "requestTimeout": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$"
+            },
+            "llmRequestCosts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "metadataKey",
+                  "type"
+                ]
+              }
+            },
+            "rateLimit": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "clientHeader": {
+                  "type": "string"
+                },
+                "tokens": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "unit": {
+                  "enum": [
+                    "Second",
+                    "Minute",
+                    "Hour",
+                    "Day"
+                  ]
+                },
+                "costKey": {
+                  "type": "string"
+                },
+                "extraRules": {
+                  "type": "array"
+                }
+              }
+            }
+          }
+        },
+        "gatewayHealth": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "path": {
+              "type": "string",
+              "pattern": "^/"
+            }
+          }
+        }
+      }
+    },
+    "argocd": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "globalName": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "fqdn": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
