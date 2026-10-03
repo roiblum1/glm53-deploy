@@ -32,8 +32,14 @@ The design rests on a premise nobody listed: that prefix affinity already works 
 In this chart it doesn't. Each pod is DP8 behind one port. The EPP picks a pod, and then vLLM's
 internal DP load balancer picks one of 8 independent KV pools **by load alone**. The llm-d index is
 also pod-level, not rank-level. No KV events are configured either. So the cache-warm site that
-tier 0 would aim for mostly does not turn into a cache hit. Fix tier 3 first. It is cheaper, it
-helps every site today, and it is what makes K measurable at all.
+tier 0 would aim for mostly does not turn into a cache hit.
+
+A9 kills only the **prefix** term of the tier-0 score. The **headroom** term, which is the stated
+goal of pooling hardware across sites, doesn't depend on tier 3. So the plan runs two tracks in
+parallel (see Revised plan): fix tier-3 affinity on one, and ship a load-first tier 0 on the other.
+The prefix term stays switched off until a measured per-rank hit rate justifies it. Gate both on
+measuring A9 first. The A9 refutation is source-level, and the hit-rate metric settles it in a
+minute.
 
 Several other claims are wrong:
 - The load metric name in D8 doesn't exist in vLLM 0.30.
@@ -57,7 +63,7 @@ Several other claims are wrong:
 | A6 | K ≈ 2.5 | **Unresolved; probably too low for agent contexts, and not a constant** | External data points. (1) Qwen3-32B, a 10K-token prompt: TTFT 4.3 s cold, 0.6 s warm (≈7×), from llm-d blog 2025-09-24. (2) GLM-5.2 agentic run: cached turns reach first token 2.8× faster, queue-inclusive. Recomputing ~45K tokens took ~5.7 s server time, against a 59 ms CPU-tier restore (llm-d blog 2026-07-22). | K depends on context length, on how much of the request is uncached, **and on queue depth**. A cold request also adds prefill work in front of everyone else's. Model it as a predicted-TTFT cost, not a multiplier (E5). Measure it per DP rank (procedure below). |
 | A7 | A shared cross-site KV tier isn't worth building | **Refuted on economics, upheld on priority** | GLM-5.2 MLA (FP8) ≈ **44 KB/token** (llm-d GLM-5.2 blog). GLM-5.3 is assumed to be close; the DSA indexer cache adds a little. 100K tokens ≈ 4.4 GB, which takes ≈ 3.5 s at 10 Gb/s, 1.4 s at 25 Gb/s and 0.35 s at 100 Gb/s, against roughly 10 s+ to recompute. | Transfer beats recompute at ≥ 25 Gb/s of **available** inter-site bandwidth. But the first and much cheaper win is **intra-site CPU KV offloading** (59 ms restore), which this chart doesn't enable. Do that first, then revisit the cross-site tier. |
 | A8 | A cross-site index on the shared Valkey backend | **Refuted as framed** | llm-d-kv-cache `pkg/kvevents/engineadapter/common.go`: the pod ID is the middle field of the ZMQ topic `kv@<pod-id>@<model>`, which llm-d sets to pod IP:port. OpenShift's default `clusterNetwork` (10.128.0.0/14) is identical on every cluster unless it was changed at install, so IDs **collide across sites**. `pkg/kvcache/kvblock/redis.go` has **no TTL or expiry** (0 matches), so a partitioned site's entries live until an `AllBlocksCleared` that will never arrive. Each `Lookup` is a pipelined `HKEYS` per block, which puts one WAN RTT on every score and on every event write. In pod-discovery mode the host connects to each pod's ZMQ socket, so pod IPs would have to be routable between clusters. The architecture doc itself says Redis is "rarely necessary since each in-memory replica converges from the event stream". The DP-rank dimension is also missing (`event_dedup_filter.go:28-41`, TODO #370). | Don't share an index across the WAN. The viable pattern is what Dynamo built: a **per-site relay** keeps exact ownership local and publishes a compact, lossy, site-namespaced projection (a Cuckoo filter per pool) plus load, over gRPC. See Prior art. It is a v2 at best. |
-| **A9** (new) | Prefix affinity works *within* a site, so a "warm site" means a cache hit | **Refuted** | `values/glm53-b200.yaml:3-4` says "vLLM balances across the 8 local ranks". At vLLM v0.30.0 `vllm/v1/engine/core_client.py:1548-1560`, `DPLBAsyncMPClient` picks the engine from `waiting+running` and KV pressure, with no prefix input, unless the request carries `X-data-parallel-rank` (`entrypoints/generate/base/serving.py:243`). The recipe sets no `kv-events-config`. llm-d's own GLM-5.2 reference exposes each rank as its own endpoint (`--data-parallel-multi-port-external-lb`, guides/wide-ep/modelserver/gpu/vllm-glm-5.2). | Today a repeat prefix lands on the rank holding it about 1 time in 8, so tier-3 hit rates and any naive K measurement are both wrong. **This is the top item in the revised plan.** |
+| **A9** (new) | Prefix affinity works *within* a site, so a "warm site" means a cache hit | **Refuted** | `values/glm53-b200.yaml:3-4` says "vLLM balances across the 8 local ranks". At vLLM v0.30.0 `vllm/v1/engine/core_client.py:1548-1560`, `DPLBAsyncMPClient` picks the engine from `waiting+running` and KV pressure, with no prefix input, unless the request carries `X-data-parallel-rank` (`entrypoints/generate/base/serving.py:243`). The recipe sets no `kv-events-config`. llm-d's own GLM-5.2 reference exposes each rank as its own endpoint (`--data-parallel-multi-port-external-lb`, guides/wide-ep/modelserver/gpu/vllm-glm-5.2). | Today a repeat prefix lands on the rank holding it about 1 time in 8, so tier-3 hit rates and any naive K measurement are both wrong. Per-rank endpoints on **one pod** can be expressed without a topology change. InferencePool v1 `targetPorts` takes up to 8 ports, and "every port will be treated as a distinctive endpoint by EPP, addressable as a 'podIP:portNumber' combination" (GIE `api/v1/inferencepool_types.go:72-81`). Agent Router routes InferencePool traffic through an `ORIGINAL_DST` cluster to the ip:port the EPP returns (`post_cluster_modify.go:61-69`). llm-d's wide-EP router lists ports 8000-8007 ("Without this, only rank 0 receives traffic"). The open question is whether KServe v0.21 lets the `LLMInferenceService` set the generated pool's `targetPorts`. **Not yet measured:** gate on the per-engine hit rate (Measurements). |
 | **A10** (new) | The circuit breaker in D11 queues overflow locally | **Refuted** | Envoy circuit breakers reject overflow with 503 (`x-envoy-overloaded`). `maxPendingRequests` only bounds requests waiting for a pool connection. Over HTTP/2, one connection multiplexes, so the effective limit is `maxParallelRequests`, and past it the request fails fast. | Overflow must be routed, not queued. Use a priority fallback on the rule (see Revised plan). |
 | **A11** (new) | Every site serves an identical recipe, so any request fits anywhere | **At risk** | Only `glm53-b200.yaml` exists. H200 and B300 recipes sized to their hardware will likely differ in `max-model-len` (the recipe comment ties it to one rank's KV pool) and `max-num-seqs`. | A 200K-token request routed to a site with a smaller `max-model-len` returns 400. Either pin `max-model-len` fleet-wide, or have the load reporter export it and the picker filter on it. |
 
@@ -90,9 +96,20 @@ for n in (4_000, 16_000, 64_000, 128_000, 200_000):
 EOF
 ```
 
-Run it once idle and once under the AIPerf load, since K grows with queue depth. Also read
-`vllm:prefix_cache_hits_total / vllm:prefix_cache_queries_total` per `engine` label on a busy pod.
-That gives the **current** tier-3 hit rate, the baseline for A9.
+Run it once idle and once under the AIPerf load, since K grows with queue depth.
+
+**A9: run this first; it gates Track A.** Measure the current per-rank hit rate on a busy pod. The
+counters `vllm:prefix_cache_hits` and `vllm:prefix_cache_queries` are exported per `engine` (DP
+rank) at v0.30.0 (`loggers.py:590-601`, with a `_total` suffix). Take two scrapes a minute apart and
+diff them:
+
+```bash
+oc -n llm-glm53 exec <pod> -- sh -c 'curl -s localhost:<vllm port>/metrics | grep -E "^vllm:prefix_cache_(hits|queries)_total"'
+```
+
+If the hit/query ratio per engine sits far below the workload's reusable-prefix share (llm-d's GLM
+agentic trace: 96% of turns reuse ≥ 90% of input), A9 is confirmed empirically. If it is already
+high, the workload is single-rank-sticky by accident, and Track A drops in priority.
 
 **Inter-site RTT and bandwidth.** Check the connection and transfer times from a pod in each site
 to each peer's gateway:
@@ -201,20 +218,38 @@ Where it diverges:
 
 ## Revised plan
 
-The original Step 0 stays. A new Step 1 comes before everything cross-site.
+**Step 0: Measure** (as above). The A9 hit-rate check comes first. Then K, RTT, bandwidth, body
+sizes, ECS and the weekly imbalance.
 
-**Step 0: Measure** (as above). Add the per-engine prefix-hit-rate baseline.
+After Step 0, two tracks run in parallel. Track B delivers the stated goal, pooling hardware, and
+touches only gateway config. Track A changes the serving stack on production clusters, the riskier
+of the two, so it shouldn't hold Track B up.
 
-**Step 1 (new): Fix tier-3 affinity.** No cross-site work yet.
-- Make DP ranks individually routable: `--data-parallel-multi-port-external-lb` with the EPP scoring
-  per-rank endpoints, as llm-d's GLM reference does, or an EPP that injects `X-data-parallel-rank`.
-- Turn on KV events and the precise prefix scorer, with the current llm-d default "sticky until
-  saturated" scheduler config.
-- Turn on CPU KV offloading (A7: a 59 ms restore against seconds of recompute).
+### Track A: tier-3 affinity
 
-All three touch `LLMInferenceService` fields (`spec.router.scheduler`, worker ports, vLLM args).
-**You need to confirm the field names against KServe v0.21 on the cluster before I template them.**
-Then re-measure hit rate and K.
+**A1. Confirm the pool can be per-rank.** Check whether KServe v0.21's `LLMInferenceService` lets
+you set the generated InferencePool's `targetPorts`, or point it at a user-supplied pool. Also check
+whether the KServe preset's injected `--port` coexists with `--data-parallel-multi-port-external-lb`.
+Rank ports are `--port` + rank, as in llm-d's reference (`--port 8000`, pool lists 8000-8007).
+
+The API side is solved (A9 row). Only the KServe wiring is open. If KServe can't express it, the
+fallback is an EPP that injects `X-data-parallel-rank` and keeps one port. That is not a move to one
+rank per pod, which would break the chart's full-node pod and static `local` PV design.
+
+**A2. Turn on KV events and precise prefix scoring.** Use llm-d's current "sticky until saturated"
+scheduler config. KV events must be per rank: vLLM offsets the ZMQ port by rank (`offset_endpoint_port`).
+
+**A3. Turn on CPU KV offloading.** A 59 ms restore beats seconds of recompute (A7). llm-d's GLM
+reference sizes this as 1500Gi of memory and `/dev/shm` per pod for 8 ranks. Compare that with the
+chart's `limits.memory: 1536Gi` and `shmSize: 64Gi`; those don't fit together as-is.
+
+**A4. Re-measure** the per-rank hit rate and K. This is the gate for turning on the prefix term in
+Track B.
+
+All of these touch `LLMInferenceService` fields. **Confirm them against KServe v0.21 on the cluster
+before I template them.**
+
+### Track B: load-first tier 0
 
 **Step 2: Load reporters.** As before, with these changes:
 - Use `vllm:kv_cache_usage_perc`, max per engine, and the sum of waiting.
@@ -225,26 +260,59 @@ Then re-measure hit rate and K.
 - Add `peers:` to the site values.
 - Add a peer-only mTLS listener for the serving `AIGatewayRoute`.
 - Render one `AIServiceBackend` per peer.
-- Make the metering decision (open question 4).
+- Metering (decided, Q4): `llmRequestCosts` and the token limit live on the **tier-0** route only.
+  The serving route on the peer-only listener charges nothing; it has no untrusted clients.
+  The tenant header must be derived at tier 0 and forwarded over mTLS, and the serving listener must
+  trust it only from peer identities.
 - Drop the D11 breaker as an overflow mechanism. Each `x-target-site=siteN` rule lists siteN at
   priority 0 and the local site at priority 1. Priority is honoured on `AIServiceBackend`.
 
 **Step 4: Tier 0 and the picker, v1 without an index.** A **rendezvous hash with bounded load over a
 prefix fingerprint**:
-- Hash the system prompt plus the first N KB of messages to a home site.
-- Use the home site unless it is over a calibrated τ (llm-d's method, at site level). Above τ, pick
-  among sites under τ, weighted-random by absolute headroom.
+- Hash the system prompt plus the first N KB of messages. That gives a full ranking of sites, not
+  just a winner.
+- Use rank 1, the home site, unless it is over τ. Then use rank 2, the deterministic overflow home,
+  unless it is also over τ. A hot prefix stays on two sites, not four.
+- Only if both are over τ, pick among the sites under τ, weighted-random by absolute headroom.
+  That is the herd-safe last resort.
 
-This needs no shared state. Every tier 0 agrees on the home site without coordinating, and that
-removes most of the herd. It is not llm-d's "approximate" routing-history scheme. It is deterministic
-placement and has no index to go stale. Run the A1/A2 sandbox test first.
+τ is the prefix-term switch. Before Track A lands, set τ low. Tier 0 is then effectively load-first,
+and the hash ranking only breaks ties and keeps placement deterministic, rather than stubbing
+affinity to a flat 1.0. That costs nothing, keeps whatever accidental hits exist today, and means
+"turning on the prefix term" later is a τ change, not a picker change. Raise τ once Track A's
+measured hit rate justifies it. Calibrate τ the way llm-d does it per (model, accelerator),
+normalised per site for H200/B200/B300.
+
+This needs no shared state. Every tier 0 agrees on the ranking without coordinating, which removes
+most of the herd. It is not llm-d's "approximate" routing-history scheme: placement is deterministic
+and there is no index to go stale. Run the A1/A2 sandbox test first.
+
+**Step 4b: Fleet-wide token budgets.** Point all four Envoy Gateway rate-limit services at **one
+shared Valkey**. This is a much lighter cross-site dependency than the refuted KV index: one counter
+op per request at < 10 ms, keyed by tenant, with no pod identity. Three things to settle:
+- **Failure mode.** Envoy Gateway's global rate limit is fail-open unless `failClosed` is set
+  (`internal/xds/translator/ratelimit.go:152-153`). A Valkey outage therefore means no limits
+  fleet-wide, not an outage. That is probably the right default; state it in the README.
+- **Placement.** The Valkey has to live somewhere. Use a primary with cross-site replicas and
+  Sentinel (the Envoy rate-limit service supports Sentinel), so one site's loss doesn't stop
+  enforcement for longer than a failover.
+- **Scope.** The Redis URL is Envoy Gateway install config, not chart config. It is a cluster
+  pre-req, documented in "Cluster pre-reqs".
 
 **Step 5: Demote GSLB.** As before, plus `downResponse`.
 
-**Step 6 (deferred): Precise cross-site index** via a per-site relay publishing a compact projection
-(Dynamo's pattern). Either adopt the Dynamo relay if your Dynamo deployments can feed it, or build a
-thin relay on llm-d-kv-cache with site-namespaced pod IDs. Only do this if Step 0 and Step 4 data
-show home-site hashing leaves real hits on the table.
+**Step 6: Precise cross-site index via the Dynamo DC KV Relay** (Q8 answered: Dynamo is preferred).
+This is a real candidate, not a deferral. It still comes after Track A, because a site-level "this
+prefix is here" signal is only worth acting on once tier 3 turns it into a hit.
+
+The first investigation is the integration seam. The relay runs on the Dynamo runtime and consumes
+Dynamo workers' KV events, but these sites serve through KServe/llm-d. So either:
+- (a) the relay can ingest plain vLLM ZMQ KV events from llm-d pods, which needs checking against
+  `lib/llm/src/kv_dc_relay/docs/architecture.md` and the gRPC contract; or
+- (b) a thin adapter publishes llm-d-kv-cache state through the relay's gRPC contract.
+
+Tier 0 consumes the per-site Cuckoo-filter projections. A hit adds one more rank-1 candidate, ahead
+of the hash ranking.
 
 **Air-gap check:**
 - Everything above is mirrorable: Valkey, the llm-d EPP and tokenizer images, Dynamo relay images,
@@ -266,13 +334,13 @@ show home-site hashing leaves real hits on the table.
 3. **Pod CIDRs.** Each site's pod CIDR:
    `oc get network.config cluster -o jsonpath='{.spec.clusterNetwork[*].cidr}'`. Identical CIDRs
    rule out any shared pod-keyed index.
-4. **Metering.** Where should token metering live: at the entry site's tier 0 (one charge, but
-   per-entry-site budgets) or at the serving site (budget follows the GPUs, but a tenant's spend is
-   split across sites)?
+4. ~~**Metering.**~~ **Answered:** at the entry tier 0, with budgets in one shared Valkey (Step 4b).
+   Still open: where that Valkey lives, and whether fail-open is acceptable.
 5. **Bandwidth.** Inter-site bandwidth and contention, not RTT. This decides A7.
 6. **Pinning.** Are there residency or failure-domain rules that pin any tenant or data to a site?
    Tier 0 would need a filter for them.
 7. **Recipes.** Will the H200 and B300 recipes keep `max-model-len` at 262144? If not, the picker
    needs a per-site context filter (A11).
-8. **Dynamo.** Is the Dynamo relay acceptable as a dependency, given Dynamo already runs elsewhere
-   in the org, or must tier 0 stay within the llm-d/KServe stack?
+8. ~~**Dynamo.**~~ **Answered:** yes, Dynamo is preferred. Step 6 is now the relay, pending the
+   integration seam above. Still open: which Dynamo version runs elsewhere in the org (the relay is
+   v1.4+ and experimental), and whether those images are already mirrored.
