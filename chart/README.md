@@ -162,6 +162,8 @@ The release name becomes the `LLMInferenceService` name and the prefix of the PV
 
 ## Cross-site pooling
 
+Full rationale: [`docs/cross-site-architecture.md`](../docs/cross-site-architecture.md).
+
 `crossSite` makes every site's gateway a tier 0 that spreads the model's requests over all sites, itself included. Behind the one global name, the fleet behaves as a single pool of GPUs instead of isolated sites with failover.
 
 ```

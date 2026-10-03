@@ -20,6 +20,40 @@ Sources read at these revisions:
 
 ---
 
+## Status (2026-10-03, after review)
+
+**Decided:**
+- **Fleet scope.** GLM-5.3 **FP4 on B200 only**, on a subset of the original four sites (which ones
+  is still open). That makes the fleet homogeneous: one recipe everywhere, capacity weight = node
+  count. A11 (`max-model-len` differing per site) and the H200 two-node DP16 problem no longer
+  apply.
+- **Track B first, Envoy-native, no custom picker.** The tier-0 picker (Step 4) is deferred.
+  A9 means cross-site prefix affinity buys little today. Load-only pooling is what delivers "use
+  all my hardware", and it needs no new image.
+- **Metering at the entry tier 0; rate limiter fails open** (Q4, Step 4b).
+- **Dynamo is the preferred Step 6** (Q8).
+
+**Built and merged to `main`:** the chart's `crossSite` mode (PR #2). The design deviates from Step 3
+below where Envoy Gateway's source showed a simpler mechanism:
+- **One merged cluster plus retries, not per-site priority fallback rules.** At v1.8.5, Envoy
+  Gateway turns a rule's `backendRefs` into **one** Envoy cluster with one locality per backend,
+  as long as every backend has the same address type and no per-backend filters
+  (`internal/ir/xds.go` `NeedsClusterPerSetting`). Retries use the `previous_hosts` predicate
+  (`internal/xds/translator/route.go:800-816`), so a retried request moves to a **different site**.
+  A per-site `x-target-site` rule with local-site priority fallback isn't needed without a picker.
+- **Shedding happens at the receiving site, not with a breaker at the sender.** Each site's serving
+  route has a circuit breaker at its own capacity and returns 503 past it. Envoy retries 503s
+  carrying `x-envoy-overloaded`; only `x-envoy-ratelimited` blocks a retry
+  (`source/common/router/retry_state_impl.cc:356-361`). So the sender's tier 0 moves the request
+  on. That gives A10's "overflow must be routed, not queued" without any load data.
+- **The local site is in `crossSite.sites` like the others** (D4); there is no separate `peers:`
+  list.
+- **Load reporters (Step 2) not built.** Nothing consumes them until the picker exists.
+
+Full rationale: [`docs/cross-site-architecture.md`](docs/cross-site-architecture.md).
+
+---
+
 ## Verdict
 
 **Sound in shape, wrong about what to do next.** The tier-0 mechanism holds up at the source level.
@@ -289,8 +323,10 @@ before I template them.**
   The serving route on the peer-only listener charges nothing; it has no untrusted clients.
   The tenant header must be derived at tier 0 and forwarded over mTLS, and the serving listener must
   trust it only from peer identities.
-- Drop the D11 breaker as an overflow mechanism. Each `x-target-site=siteN` rule lists siteN at
-  priority 0 and the local site at priority 1. Priority is honoured on `AIServiceBackend`.
+- Drop the D11 breaker as an overflow mechanism. ~~Each `x-target-site=siteN` rule lists siteN at
+  priority 0 and the local site at priority 1.~~ **Superseded (see Status):** one merged cluster,
+  shedding at the receiver, and a sender retry that moves to another site. The per-site rule
+  returns with the picker.
 
 **Step 4: Tier 0 and the picker, v1 without an index.** A **rendezvous hash with bounded load over a
 prefix fingerprint**:
@@ -317,8 +353,8 @@ Two details:
 - **Band hysteresis.** A site whose headroom sits on a band edge flips bands between polls. That
   moves its prefixes' placement back and forth, the same oscillation in a new place. Enter a band
   at the edge and leave it only 2-3 points past the edge.
-- **Normalisation.** Bands are computed on headroom normalised per site (H200/B200/B300), so a band
-  means the same spare capacity everywhere.
+- **Normalisation.** Bands are computed on headroom normalised per site, so a band means the same
+  spare capacity everywhere. On the B200-only fleet that is node count.
 
 This needs no shared state. Every tier 0 agrees on the ranking without coordinating, which removes
 most of the herd. It is not llm-d's "approximate" routing-history scheme: placement is deterministic
@@ -407,16 +443,21 @@ ranking.
 5. **Bandwidth.** Inter-site bandwidth and contention, not RTT. This decides A7.
 6. **Pinning.** Are there residency or failure-domain rules that pin any tenant or data to a site?
    Tier 0 would need a filter for them.
-7. **Recipes.** Will the H200 and B300 recipes keep `max-model-len` at 262144? If not, the picker
-   needs a per-site context filter (A11).
-   - **The H200 deployment as described isn't expressible in this chart.** DP16 across two nodes
-     needs a multi-node (LeaderWorkerSet) worker spec. The chart's design is one full-node pod per
-     node with "data and expert parallelism inside the node". Bringing H200 sites under this chart
-     is its own work item. Until then "same chart recipe at every site" isn't true, and tier 0 must
-     not assume identical semantics: compare `max-model-len`, tokenizer and revision through the
-     load reporter.
-   - What does the H200 deployment run today: chart, KV offload tier, DP load-balancer mode?
-9. **Node RAM** per hardware type, and peak cgroup `anon`/`file` during a cold load (Track A3).
+7. ~~**Recipes.**~~ **Resolved by scope:** one FP4 B200 recipe on every site, so `max-model-len`
+   matches everywhere (A11), and the H200 multi-node deployment is out of scope.
 8. ~~**Dynamo.**~~ **Answered:** yes, Dynamo is preferred. Step 6 is now the relay, pending the
-   event-stream shim question above. Still open: which Dynamo version runs elsewhere in the org (the relay is
-   v1.4+ and experimental), and whether those images are already mirrored.
+   event-stream shim question above. Still open: which Dynamo version runs elsewhere in the org
+   (the relay is v1.4+ and experimental), and whether those images are already mirrored.
+9. **Node RAM** on the B200 nodes, and peak cgroup `anon`/`file` during a cold load (Track A3).
+10. **Which sites** take part, and their node counts (the `crossSite.sites` list, with weights).
+11. **The FP4 recipe** (`values/glm53-fp4-b200.yaml`), including
+    `crossSite.serving.requestsPerNode`.
+12. **CRD fields used by `crossSite`, checked against the cluster.** They were read from
+    Agent Router v1.1.0 and Envoy Gateway v1.8.5 source:
+    - `AIServiceBackend.spec.{schema,backendRef}`
+    - `AIGatewayRoute` `rules[].name` and `backendRefs[].weight`
+    - `Backend.spec.tls.{sni,caCertificateRefs,clientCertificateRef}`
+    - `BackendTrafficPolicy` `retry`, `healthCheck.{panicThreshold,active.http.hostname}` and
+      `circuitBreaker`
+13. **AMKO `GSLBHostRule` down-response field** (Step 5). Its exact name and values, before it is
+    added to the template.
