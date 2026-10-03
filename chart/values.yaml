@@ -207,108 +207,29 @@ argocd:
     policy: 1
     route: 2
 
-globalName:
-  # One name in front of every site (AKO + AMKO). These objects describe the
-  # gateway, not the model: if several releases share a gateway on a cluster,
-  # enable this in only one of them.
-  enabled: false
-  # The same on every site, e.g. llm.example.internal
-  fqdn: ""
-
-  hostRule:
-    # AKO HostRule mapping this cluster's gateway FQDN to the global FQDN.
-    # Needed on every cluster when AMKO runs in custom global FQDN mode
-    # (GSLBConfig useCustomGlobalFqdn: true). In default mode AMKO groups
-    # Services by identical hostname instead; set create: false.
-    create: true
-    apiVersion: ako.vmware.com/v1beta1
-    # Namespace of the gateway's LoadBalancer Service on this cluster.
-    namespace: ""
-    # The FQDN AKO assigned to that Service on this cluster.
-    localFqdn: ""
-
-  gslbHostRule:
-    # Create on the AMKO leader cluster only; AMKO pushes the GslbService to
-    # the Avi GSLB sites itself.
-    create: false
-    apiVersion: amko.vmware.com/v1alpha1
-    namespace: avi-system
-    # Clients re-resolve this often. Open connections are not affected, so a
-    # low TTL only speeds up failover.
-    ttl: 30
-    # Federated HTTPS monitors that already exist on the Avi controller. Use
-    # one that requests healthRoute's path and expects 200; the default L4
-    # monitor only proves the gateway port is open.
-    healthMonitorRefs: []
-    # Consistent hash keeps a client on one site, so its conversations keep
-    # hitting a warm prefix cache. The hash is on the DNS resolver's address
-    # unless resolvers send EDNS client subnet: with only a few resolvers it
-    # can put most traffic on a few sites. Then use GSLB_ALGORITHM_ROUND_ROBIN
-    # (even load, cold cache whenever a client moves) or GSLB_ALGORITHM_TOPOLOGY.
-    poolAlgorithmSettings:
-      lbAlgorithm: GSLB_ALGORITHM_CONSISTENT_HASH
-      hashMask: 24
-    # Optional per-cluster {cluster, weight (1-20), priority}. Weight sites by
-    # their node count when they differ in size.
-    trafficSplit: []
-
 crossSite:
-  # Tier 0: this site's gateway spreads the model's requests over every site in
-  # `sites` (itself included), weighted by capacity, so the fleet is one pool of
-  # GPUs. Each site sheds 503 at its own serving route when full and the sender
-  # retries another site. Off = single-site routing as before.
-  # Turning it on moves the serving AIGatewayRoute to `peerListener` and moves
-  # metering and the token budget to the tier-0 route on route.gateway's listener.
+  # Serve this model to the whole fleet. The serving route moves to
+  # `peerListener` (mTLS, only other sites' gateways reach it) and stops
+  # metering; the fleet release (fleet/, one per cluster) owns tier 0, metering,
+  # the token budget and the global name. Off = single-site routing as before.
   enabled: false
-  # This site's name in `sites`.
+  # This site's name in values/fleet.yaml `sites`. The benchmark hook pins itself to it.
   self: ""
-  # sectionName of the peer-only listener on route.gateway: HTTPS with client
-  # certificate validation, no hostname restriction, never reachable by clients
-  # without a peer certificate. Not created by this chart (see README pre-reqs).
+  # sectionName of the peer-only listener on route.gateway. route.gateway.sectionName
+  # (the fleet's client listener) must be set and differ from it.
   peerListener: ""
-  # Default port for sites[].port.
-  port: 8443
-  # Every site serving this model, this one included. The same list on every site.
-  #   - {name: site1, address: llm.site1.example.internal, weight: 2}
-  # address must be a hostname (an IP splits the tier-0 cluster per site and
-  # breaks cross-site retry). For this site, the site's own gateway name works
-  # (hairpins through its VIP) as does the Envoy Service's cluster-local name.
-  # weight: share of fleet capacity, e.g. node count.
-  sites: []
-  tls:
-    # Sent as SNI and health-check Host to every site; each peer listener's
-    # certificate must cover it. Default: globalName.fqdn.
-    hostname: ""
-    # CA that signed the peer listeners' certificates (key ca.crt), in the
-    # release namespace.
-    caCertificateRef:
-      kind: ConfigMap
-      name: ""
-    # kubernetes.io/tls Secret in the release namespace, presented to peers.
-    clientCertificateSecret: ""
-  # Requests carrying this header with a site name go to that site only. The
-  # benchmark hook sets it to `self`.
+  # Must match the fleet chart's crossSite.pinHeader.
   pinHeader: x-site-pin
-  retry:
-    # Attempts after the first, each to a different site. Only before the
-    # response starts: a 503 shed, connect failure or reset.
-    numRetries: 2
-    baseInterval: 100ms
-    maxInterval: 1s
-  healthCheck:
-    interval: 5s
-    timeout: 3s
-    unhealthyThreshold: 3
-    healthyThreshold: 2
-  # Tier-0 circuit breaker per Envoy replica, across all sites. Envoy's default
-  # (1024) would cap the fleet; the real limit is each site's shed point.
-  maxParallelRequests: 100000
   serving:
-    # In-flight requests one node absorbs before the site sheds: running slots
-    # (DP ranks x max-num-seqs) plus a short queue. Set in the recipe.
+    # In-flight requests one node absorbs before the site sheds. Size it from
+    # work, not slots: vLLM logs "Maximum concurrency for <N> tokens per
+    # request" at startup; take it at a realistic context length (agent
+    # requests are ~200K tokens, not max-model-len) and add a short queue.
+    # Set in the recipe.
     requestsPerNode: null
     # Envoy replicas of this site's gateway. Circuit breakers count per replica,
-    # so the shed point per replica is requestsPerNode x len(nodes) / this.
+    # so the shed point per replica is requestsPerNode x len(nodes) / this. Keep
+    # the replica count fixed (no autoscaling) or the shed point moves with it.
     gatewayReplicas: null
     # Requests that may wait for a connection to vLLM once the shed point is reached.
     maxPendingRequests: 64
