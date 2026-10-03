@@ -1,19 +1,30 @@
 # Cross-site serving behind one endpoint: what we built and why
 
-GLM-5.3 runs on several B200 sites, each its own air-gapped OpenShift cluster. This document
-explains how one URL in front of them makes the sites behave as **one pool of GPUs**, how we got to
-this design, and what was deliberately left out.
+Several models run on four sites, each its own air-gapped OpenShift cluster:
 
+| Model | Hardware | Sites |
+|---|---|---|
+| GLM-5.3 FP4 | B200 | 2 |
+| Kimi K2.7 | H200 | 3 |
+| Qwen3.8 27B | | 2 |
+
+This document explains:
+- how one URL in front of them makes the sites behave as **one pool of GPUs per model**;
+- how we got to this design;
+- what was deliberately left out.
+
+References:
 - The design audit, with source citations, is in [`FINDINGS.md`](../FINDINGS.md).
-- The operator reference (values, pre-reqs, verify commands) is the "Cross-site pooling" section of
-  [`chart/README.md`](../chart/README.md).
+- The operator references are [`fleet/README.md`](../fleet/README.md) (tier 0) and the "Cross-site
+  serving" section of [`chart/README.md`](../chart/README.md) (model releases).
 
 ---
 
 ## 1. Goal and constraints
 
-**Goal:** one URL; every site's GPUs usable by every client. The platform owner's priorities, in
-order:
+**Goal:** one URL; every model reachable from any site; each model's requests spread over every
+site that serves it. **Which sites serve which model, and how loaded they are, must be discovered,
+not listed.** The platform owner's priorities, in order:
 1. Use the hardware across all sites (GPU saturation).
 2. Keep KV-cache locality where it is real.
 3. WAN latency, last.
@@ -25,9 +36,10 @@ order:
 | Air-gapped clusters, internal registry, internal S3 | Nothing new may need internet. A new component costs an internal image build and mirror. |
 | Avi/AKO load balancing, Avi GSLB via AMKO, no MetalLB | No anycast. The global name is DNS GSLB. |
 | Inter-site RTT < 10 ms | Distance is cheap. A cross-site hop adds about one RTT to time-to-first-token. |
-| Agent Router (Envoy AI Gateway) v1.1 on Envoy Gateway | Routing must be expressible in `AIGatewayRoute` / Envoy Gateway policy, or be a new ext-proc. |
-| Fleet: **GLM-5.3 FP4 on B200 only**, a subset of the sites | Homogeneous: one recipe, so capacity = node count. |
-| Argo CD delivers the chart; the chart stays generic | Model settings in `values/<model>-<hw>.yaml`, cluster settings in `values/sites/<cluster>.yaml`. |
+| Agent Router (Envoy AI Gateway) v1.1 on Envoy Gateway v1.8 | Routing must be expressible in `AIGatewayRoute` / Envoy Gateway policy, or be a new ext-proc. |
+| Several models, unevenly placed, mixed hardware across models | Tier 0 can't belong to one model's release, and must not assume a model runs everywhere. |
+| One hardware type per model | A model behaves identically on every site that serves it (same recipe, same `max-model-len`). |
+| Argo CD delivers the charts; charts stay generic | Model settings in `values/<model>-<hw>.yaml`, cluster settings in `values/sites/<cluster>.yaml`, fleet catalogue in `values/fleet.yaml`. |
 
 ---
 
@@ -113,170 +125,208 @@ Track B could have started with the picker ext-proc. We chose Envoy-native first
   overflow alone don't need it.
 - **A picker is a new air-gapped workload**: a Go service, an internal image, and its own
   availability problem in the request path of every site.
-- **The source showed Envoy can already do the important half.** Two properties make it work:
-  - **One cluster, many sites.** Envoy Gateway v1.8.5 merges a rule's `backendRefs` into **one**
-    Envoy cluster with one locality per backend. That requires every backend to have the same
-    address type (`internal/ir/xds.go` `NeedsClusterPerSetting`).
-  - **Retries change site.** Retries use the `previous_hosts` predicate (`route.go:800-816`), so a
-    retry goes to a *different* backend, which here means a different site.
+- **The source showed Envoy can already do the important half:**
+  - shedding at the destination plus retrying at the sender moves overflow to another site with no
+    load reporting at all (a 503 carrying `x-envoy-overloaded` is retried; retries skip hosts
+    already tried);
+  - health checks give membership;
+  - least-request gives a local load signal.
 
-  Shedding at the destination plus retrying at the sender gives "overflow moves to another site"
-  with no load reporting at all.
+### 3.4 From one model to a fleet, and the correction it forced
 
-What we give up: load-aware choice beyond shedding, and any cross-site affinity. Both come back
-with the picker once Track A makes affinity worth having.
+The first version (`crossSite` in the model chart, PR #2) assumed one model on a homogeneous B200
+fleet. It had three properties:
+- each model release carried its own tier-0 route;
+- each release had a hand-written list of sites;
+- sites were weighted by node count.
+
+The actual fleet broke all three:
+
+- **A client can enter at a site without the model.** Only releases of that model rendered its
+  tier-0 route, so the other sites returned 404.
+- **GSLB monitored one model.** A site without GLM looked dead to everyone, Kimi clients included.
+- **Placement was hand-maintained.** Adding a model to a site meant editing every site's file.
+
+So tier 0 moved out of the model release into **one identical fleet release per cluster**. That
+release covers every model, discovers placement by health check, and monitors the gateway, not a
+model.
+
+Making load dynamic exposed an error in the first design, found in Envoy Gateway's source:
+- Envoy Gateway's default balancer is already least-request, but with **locality weighting**, and
+  every `backendRef` becomes its own locality.
+- Envoy picks a locality by weight first. With one backend per site, least-request then has a
+  single host to choose from.
+- **For least-request (or hashing) to choose between sites, every site must be an endpoint of one
+  `Backend`.** That is one locality, and endpoint weights are fixed at 1.
+
+Static capacity weights and live least-request therefore exclude each other. We chose
+least-request: it needs no node counts, and it adapts to what the gateway sees.
 
 ---
 
 ## 4. The architecture as deployed
 
 ```
-                         llm.<domain>
-                              |
-          Avi GSLB (AMKO), round robin: picks the ENTRY gateway only
-                              |
-                site VIP (AKO L4) of any site
-                              |
-   +--------- Agent Router, client listener (https) ----------------+
-   |  tier-0 AIGatewayRoute <release>-sites                          |
-   |    rule pin-<site>: x-site-pin: <site> -> that site only        |
-   |    rule pool:  every site, weight = node count                  |
-   |  BackendTrafficPolicy <release>-sites:                          |
-   |    retry 503/connect-failure/reset -> another site              |
-   |    active health check /healthz/<model>, panicThreshold 0       |
-   |    token metering + token budget (entry site, once)             |
-   +-------------------------------+---------------------------------+
-                                   | mTLS (client cert), SNI = shared hostname
-                                   v
-   +---- chosen site's Agent Router, peer listener (8443, mTLS) -----+
-   |  serving AIGatewayRoute <release> -> InferencePool               |
-   |  BackendTrafficPolicy <release>-shed: circuit breaker            |
-   |    = requestsPerNode x nodes / gateway replicas -> 503 past it   |
-   +-------------------------------+---------------------------------+
-                                   v
-                     InferencePool -> EPP -> vLLM (DP8 per node)
+                              llm.<domain>
+                                   |
+      Avi GSLB (AMKO), round robin, monitors GET /healthz/gateway: picks the ENTRY gateway only
+                                   |
+                     site VIP (AKO L4) of any site
+                                   |
+  +---------- Agent Router, client listener (https): FLEET release, same on every cluster --------+
+  |  per model m:                                                                                  |
+  |    AIGatewayRoute fleet-<m>:  pin-<site> rules (x-site-pin) | pool -> AIServiceBackend          |
+  |                                                              fleet-all-sites (every site = 1   |
+  |                                                              endpoint, one locality)           |
+  |    BackendTrafficPolicy fleet-<m>:                                                             |
+  |      loadBalancer LeastRequest (or ConsistentHash on a header, off)                            |
+  |      healthCheck GET /healthz/<m> on every site  -> membership; panicThreshold 0               |
+  |      retry 503/connect-failure/reset, up to sites-1, each to a different site                  |
+  |      token metering + budget for m (entry site, once)                                          |
+  |  /healthz/gateway -> 200 (directResponse)                                                      |
+  +-----------------------------------------------+-----------------------------------------------+
+                                                  | mTLS (client cert), SNI = shared hostname
+                                                  v
+  +---- chosen site's Agent Router, peer listener (8443, mTLS): MODEL releases on that site ------+
+  |  serving AIGatewayRoute <release> -> InferencePool     health route /healthz/<m> -> InferencePool |
+  |  BackendTrafficPolicy <release>-shed: circuit breaker = requestsPerNode x nodes / replicas      |
+  +-----------------------------------------------+-----------------------------------------------+
+                                                  v
+                                InferencePool -> EPP -> vLLM (one pod per node)
 ```
 
 ### 4.1 One request, end to end
 
-1. **DNS.** The client resolves `llm.<domain>` and Avi returns some site's VIP, round robin. DNS
-   only spreads *entry*; it no longer decides where the GPUs work.
-2. **Tier 0.** The entry gateway's client listener matches the tier-0 route on `x-ai-eg-model`.
-   Envoy picks a site at random, weighted by node count, from the sites passing health checks.
-   The entry site itself is one of them.
-3. **The hop.** The request goes over mTLS to the chosen site's **peer listener**. On the entry
-   site itself that is a hairpin through its own gateway.
-4. **Shed or serve.** The chosen site's serving route counts in-flight requests:
-   - Under its limit, the request goes to the InferencePool, then the EPP picks a node, then vLLM.
-   - Over its limit, it answers **503 immediately**.
-5. **Retry.** On a 503, connect failure or reset, the entry site's tier 0 retries a **different**
-   site (up to `numRetries`, 2 by default), with a 100 ms to 1 s backoff. Retries happen only
-   before any response bytes reach the client, so a stream is never duplicated.
-6. **Metering.** As the response finishes, tier 0 reads token usage and charges the tenant's
-   budget, once, at the entry site.
+1. **DNS.** The client resolves `llm.<domain>`; Avi returns a VIP of any site whose gateway is up
+   (round robin).
+2. **Tier 0.** The entry gateway matches the request's model to that model's fleet route. Envoy
+   considers only the sites whose `/healthz/<model>` currently answers 200: the sites serving it,
+   possibly the entry site itself. It picks two at random and sends to the one with fewer requests
+   in flight from this gateway replica.
+3. **The hop.** The request goes over mTLS to that site's peer listener and the model release's
+   serving route.
+4. **Shed or serve.** Under the site's in-flight limit, the request goes to the InferencePool, the
+   EPP picks a node, then vLLM. Over the limit, the site answers 503 immediately.
+5. **Retry.** On a 503, connect failure or reset, tier 0 retries a different site serving the
+   model, up to `sites − 1` times, with a 100 ms to 1 s backoff. It retries only before any response
+   bytes, so a stream is never duplicated.
+6. **Metering.** Tier 0 reads token usage from the response and charges the tenant's budget for that
+   model, once, at the entry site.
 
 ### 4.2 Component by component: what, and why
 
 | Piece | What it is | Why this way |
 |---|---|---|
-| **GSLB round robin** | Avi picks the entry gateway | With tier 0, DNS no longer carries the routing decision. Consistent hashing on a few resolver IPs would just concentrate proxy load. |
-| **Tier-0 route on the client listener** | `AIGatewayRoute <release>-sites`, one `AIServiceBackend` + `Backend` per site | The CEL rule forbids mixing `InferencePool` with `AIServiceBackend`, so the local site is a backend like the rest. Identical semantics on every site. |
-| **Capacity weights** | `crossSite.sites[].weight` = node count | Homogeneous B200 fleet: capacity is proportional to nodes. Static weights are good enough because overflow is handled by shedding, not by guessing load. |
-| **Hostname-only site addresses** | Render fails on an IP | An IP next to hostnames makes Envoy Gateway build one cluster per site, and retries could no longer change site. The guarantee depends on this. |
-| **Peer listener (mTLS)** | Serving route moved to `crossSite.peerListener` | **Loop prevention by construction.** A peer request can only reach the serving route, never tier 0 again. **No bypass.** Clients can't reach the unmetered serving route without a peer certificate. The chart requires the client and peer listeners to be different and named. |
-| **Shed at the receiver** | Circuit breaker on the serving route | The receiver knows its own capacity exactly (nodes × slots), with no polling and no stale data. The breaker turns "full" into an instant 503 instead of an unbounded vLLM queue. Limits count per Envoy replica, hence the division by `gatewayReplicas`. |
-| **Retry at the sender** | `retry` with `previous_hosts` | Turns a shed into "try the next site" within milliseconds. Bounded by `numRetries`, so a fully saturated fleet returns 503 instead of looping. |
-| **Health checks, separate from load** | Active check of `/healthz/<model>` through each peer listener; `panicThreshold: 0` | **Busy and dead are separate signals.** Only "dead" removes a site; "busy" just sheds a request. That avoids the cascade where one loaded site is pulled, its load moves to the others, and they get pulled too. `panicThreshold: 0` stops Envoy's default "panic" mode from sending traffic to dead sites when most are down. |
-| **Raised tier-0 limits** | `crossSite.maxParallelRequests` (100000) | Envoy's default 1024 per replica would silently cap the *whole fleet* through one entry gateway. The real limits are each site's shed points. |
-| **Metering at entry** | `llmRequestCosts` + token budget on tier 0 only | Charged exactly once. The serving route has no untrusted clients to charge. For fleet-wide budgets, point every site's rate limit service at one Valkey. |
-| **Fail-open budgets** | Never `failClosed` | A limiter outage that stopped all inference would be far worse than budgets lapsing for minutes. Alert on `ratelimit.error` / `ratelimit.failure_mode_allowed` instead. |
-| **`x-site-pin`** | Per-site rules with an extra header match | Gateway API precedence means a rule with more header matches wins. The benchmark hook pins itself so it still gates **this** site during a rolling upgrade. Also useful for debugging. |
-| **Health route on both listeners** | `healthRoute` attached to client and peer listeners | The client listener serves the Avi monitor; the peer listener serves the other sites' tier-0 checks. |
+| **Fleet release per cluster** | `fleet/` chart: a route + policy per model, the site Backends, gateway health, global name | Tier 0 serves every model, so it can't live in one model's release. Identical everywhere: any site is a valid entry for any model. |
+| **Catalogue** | `values/fleet.yaml`: models (what is served) and sites | One line per model or site. **Where** a model runs isn't listed anywhere. |
+| **Membership by health check** | Per model: `GET /healthz/<model>` on every site's peer listener; `panicThreshold: 0` | Deploying a model on a site makes it pass and join; removing it makes it leave. A site without the model is never routed to, even when most sites are down. |
+| **One all-sites Backend** | Every site an `fqdn` endpoint of `fleet-all-sites` | Puts the sites in one locality, so least-request and hashing compare sites. Envoy Gateway builds one cluster per route rule, so each model gets its own health checks over the shared Backend. |
+| **Least-request** | `loadBalancer: LeastRequest` | A saturated site holds requests longer and gets fewer new ones. No node counts to maintain. |
+| **Hostname-only addresses** | Render fails on an IP | An IP among hostnames splits the cluster per site. Least-request, hashing and cross-site retry all depend on one cluster. |
+| **Peer listener (mTLS)** | Model releases' serving routes sit on `crossSite.peerListener` | **Loop prevention by construction.** A peer request can only reach a serving route, never tier 0 again. **No bypass.** Clients can't reach the unmetered serving routes without a peer certificate. |
+| **Shed at the receiver** | Circuit breaker on each serving route | The receiver knows its capacity. It turns "full" into an instant 503 instead of an unbounded vLLM queue. Sized from vLLM's concurrency log at a realistic context, because the limit counts requests and the real cost is tokens. |
+| **Retry at the sender** | `numRetries` = sites − 1, `previous_hosts` | A shed request reaches every other site before failing. Bounded, so a saturated fleet returns 503 instead of looping. |
+| **Busy and dead are separate** | Health checks remove; shedding only refuses one request | A loaded site is never marked down, so load can't cascade into an outage. |
+| **Raised tier-0 limits** | `fleet.maxParallelRequests` | Envoy's default 1024 per replica would cap a model fleet-wide through one entry gateway. |
+| **Metering at entry** | `llmRequestCosts` + budget on the fleet routes; none on serving routes | Charged once. For fleet-wide budgets, point every site's rate limit service at one Valkey. It fails open: lapsed budgets beat a fleet outage. |
+| **Gateway health for GSLB** | `/healthz/gateway`, answered by Envoy | Any gateway can proxy any model, so GSLB monitors the gateway. Per-model health is tier 0's job. |
+| **`x-site-pin`** | Per-site rules with an extra header match | Model releases' benchmark hooks pin to their own site, so a rolling upgrade is gated per site. Also useful for debugging. |
+| **Consistent hashing (off)** | `models[].hashHeader` | Keeps a conversation on one site, and a retry steps to a stable second site. Off until clients send a session header. Never hash on the tenant. |
 
-### 4.3 Behaviour under failure
+### 4.3 Behaviour under failure and change
 
 | Event | What happens |
 |---|---|
-| One site's GPUs full | That site sheds 503 instantly; tier 0 retries other sites. Its capacity stays in use up to its limit. |
-| Every site full | Each attempt is shed; after `numRetries` the client gets 503. Load can't amplify, because retries are bounded. |
-| A site's model down, gateway up | Its health check fails within interval × threshold (default ~15 s), and tier 0 everywhere stops sending to it. Avi's monitor on the client listener also stops sending entry traffic to it. |
-| A site's gateway down | Connect failures are retried elsewhere at once. The health check removes the site for good within ~15 s. Avi stops sending entry traffic there. |
-| Most sites down | `panicThreshold: 0`: traffic goes only to healthy sites, never to dead ones. |
-| Rate-limit Valkey down | Budgets lapse (fail open); inference continues. Alerts fire. |
-| A site not yet migrated (rollout) | Its peer listener doesn't carry the serving route, so health checks fail and it gets no cross-site traffic. **A mixed fleet is safe.** |
-| Client sends `x-site-pin` | Goes to that site only, still metered. A client can choose a site, but not skip metering. |
+| A site doesn't serve model m | Its `/healthz/m` fails; it never gets m's traffic, from any entry. |
+| Model m is deployed on a new site | It passes the health check after `healthyThreshold × interval` and joins m's pool. Nothing else changes. |
+| A new model | One line in `values/fleet.yaml`, a sync of every fleet release, then the model release where it should run. |
+| One site's GPUs full for m | It sheds 503; tier 0 retries the other sites serving m. Least-request already steers new requests away. |
+| Every site serving m full | Each attempt is shed; after `sites − 1` retries the client gets 503. Load can't amplify. |
+| m down on a site | It fails m's health check within ~15 s and leaves m's pool; other models on that site are unaffected. |
+| A site's gateway down | Connect failures are retried elsewhere at once, and health checks remove it from every model. Avi stops sending entry traffic there. |
+| The entry gateway restarts | Streams entering there are cut, wherever they were served (two gateways per stream). |
+| Rate-limit Valkey down | Budgets lapse (fail open); inference continues; alerts fire. |
 
 ---
 
 ## 5. Configuration
 
-**Generic defaults** are in `chart/values.yaml` (`crossSite.*`: retry, health check, limits, pin
-header).
-
-**Per model** (`values/<model>-<hw>.yaml`):
+**Catalogue** (`values/fleet.yaml`, identical on every cluster):
 
 ```yaml
-crossSite:
-  serving:
-    requestsPerNode: 640     # FP8 reference: 8 DP ranks x 64 seqs + ~25% queue. Set from the FP4 recipe.
+models:
+  - name: glm-5.3
+  - name: kimi-k2.7
+  - name: qwen3.8-27b
+    # hashHeader: x-session-id     # once clients send one
+sites:
+  - {name: site1, address: llm.site1.<domain>}
+  - {name: site2, address: llm.site2.<domain>}
+  - {name: site3, address: llm.site3.<domain>}
+  - {name: site4, address: llm.site4.<domain>}
 ```
 
-**Per site** (`values/sites/<cluster>.yaml`). The `sites` list is identical everywhere; only `self`
-and `gatewayReplicas` differ:
+**Per model** (`values/<model>-<hw>.yaml`): the recipe, plus
+`crossSite.serving.requestsPerNode`, taken from vLLM's
+`Maximum concurrency for <N> tokens per request` at a realistic N, plus a short queue.
+
+**Per cluster** (`values/sites/<cluster>.yaml`, read by both charts):
 
 ```yaml
 route:
-  gateway: {name: ai-gateway, namespace: ai-gateway, sectionName: https}   # client listener, required
+  gateway: {name: ai-gateway, namespace: ai-gateway, sectionName: https}   # client listener
 crossSite:
-  enabled: true
-  self: site1
+  enabled: true                 # model releases on this cluster serve the fleet
+  self: site1                   # this site's name in values/fleet.yaml
   peerListener: peers
-  sites:
-    - {name: site1, address: llm.site1.<domain>, weight: <nodes>}
-    - {name: site2, address: llm.site2.<domain>, weight: <nodes>}
   tls:
     caCertificateRef: {kind: ConfigMap, name: llm-peer-ca}
     clientCertificateSecret: llm-peer-client
   serving:
-    gatewayReplicas: <Envoy replicas of ai-gateway>
-globalName:
-  gslbHostRule:
-    poolAlgorithmSettings: {lbAlgorithm: GSLB_ALGORITHM_ROUND_ROBIN}
+    gatewayReplicas: 2          # fixed
+globalName:                     # read by the fleet chart
+  enabled: true
+  fqdn: llm.<domain>
+  hostRule: {namespace: envoy-gateway-system, localFqdn: llm.site1.<domain>}
+  gslbHostRule: {create: true, healthMonitorRefs: [fleet-gateway-health]}   # leader only
 ```
 
-**Per cluster, outside the chart** (the gateway is shared):
-- A peer listener on 8443 with no hostname and a certificate for the shared hostname.
-- A `ClientTrafficPolicy` requiring client certificates on that listener.
-- The CA and client certificate in the release namespace.
-- `enableBackend: true` in the Envoy Gateway config.
+**Per cluster, outside the charts** (the gateway is shared):
+- a peer listener (8443, no hostname, a certificate for the shared hostname);
+- a `ClientTrafficPolicy` requiring client certificates on it;
+- the CA and client certificate;
+- `enableBackend: true`;
+- an Avi monitor on `/healthz/gateway`.
 
 **Safety nets:**
-- The render refuses a misconfiguration: an IP address, missing or identical listeners, `self` not
-  in `sites`, the health route off, or a missing certificate or replica count.
-- `validate.py` independently checks the rendered manifest for:
-  - double metering;
-  - shared listeners;
-  - non-hostname backends;
-  - two policies on one route;
-  - a tier-0 policy without retry;
-  - an unpinned benchmark;
-  - a health route missing from the peer listener.
+- **Both charts refuse to render** on:
+  - an IP site address;
+  - a missing or identical client/peer listener;
+  - duplicate models or sites;
+  - `numRetries` > sites − 1;
+  - a missing certificate, health route or replica count.
+- **`validate.py` checks either render.**
+  - Fleet render: one route and one policy per model; retry, health check and `panicThreshold: 0`
+    present; one all-sites backendRef per pool rule; hostname endpoints; a gateway health route
+    behind GSLB.
+  - Model render: a shed policy, a pinned benchmark, the health route on the peer listener, and no
+    double metering.
 
 ---
 
 ## 6. Rolling it out
 
-1. **On every site, first:** the peer listener, its `ClientTrafficPolicy`, the certificates, and
-   `enableBackend`. Nothing routes there yet.
-2. **Enable `crossSite` on one canary site.** Its tier 0 sends to itself and to peers that pass
-   health checks. Peers not yet migrated fail the check and get nothing.
-3. **Verify** (README "Cross-site pooling"):
-   - Route and policy conditions are accepted.
-   - Envoy `/clusters` shows **one** tier-0 cluster listing every site.
-   - The InferencePool cluster carries the shed limit as `max_requests`.
-   - One pinned `curl` per site succeeds.
-4. **Enable the remaining sites one at a time**, each gated by its pinned benchmark hook.
-5. **Switch GSLB to round robin** once every site has tier 0.
+1. **On every cluster:**
+   - set up the peer listener, `ClientTrafficPolicy`, certificates and `enableBackend`;
+   - install the fleet release.
+
+   No model is in any pool yet: every health check fails until a model release serves on the peer
+   listener.
+2. **Enable `crossSite` in one model release on a canary site.** It passes its health check and
+   becomes reachable from every entry gateway. Verify with Envoy `/clusters` and one pinned `curl`
+   per site and model.
+3. **Enable the remaining model releases** site by site, each gated by its pinned benchmark hook.
+4. **Point Avi's monitor at `/healthz/gateway`** and use round robin.
 
 ---
 
@@ -284,27 +334,27 @@ globalName:
 
 | Not done | Why | When |
 |---|---|---|
-| Prefix affinity across sites | Worth ~1/8 of its value until per-rank DP routing (A9) | After Track A raises the measured per-rank hit rate |
-| Load-aware choice beyond shedding | Needs a picker; static weights plus shedding cover overflow | Picker: banded-headroom rendezvous hashing, a single τ knob (FINDINGS Step 4) |
-| Load reporters | Nothing consumes them without a picker | With the picker |
-| Cross-site KV index | A shared Valkey index collides and goes stale (A8) | Dynamo DC KV Relay pattern, via an event-stream shim (FINDINGS Step 6) |
+| Prefix affinity across sites | With least-request a conversation returns to its warm site only ≈ 1/sites of the time. Inside a site, DP8 behind one port already loses most hits (A9). | Turn on `hashHeader` per model once clients send a session header and Track A fixes A9 |
+| Capacity weights | Exclude least-request in Envoy Gateway v1.8. A much bigger site for a model is underused until smaller ones shed. | A picker, or per-model weights if site sizes diverge a lot |
+| A fleet-wide load signal | Least-request sees only its own gateway replica. vLLM's ORCA reports are non-streaming and per pod. | Picker: banded-headroom rendezvous hashing, a single τ knob (FINDINGS Step 4) |
+| Cross-site KV index | A shared Valkey index collides and goes stale (A8) | Dynamo DC KV Relay pattern via an event-stream shim (FINDINGS Step 6) |
 | GSLB `downResponse` | Exact AMKO field not confirmed | When confirmed |
 
-**Track A, in parallel:**
-- Make DP ranks individually routable. InferencePool `targetPorts` allows up to 8 ports per pod,
-  exactly DP8. The open question is whether KServe v0.21 exposes it.
-- Turn on KV events, precise prefix scoring and CPU KV offloading, sized from node RAM.
-- **Gate:** run the A9 hit-rate measurement first. It takes about a minute
-  (`vllm:prefix_cache_hits_total / vllm:prefix_cache_queries_total` per engine).
+**Track A runs in parallel:**
+- per-rank DP endpoints (InferencePool `targetPorts`, up to 8 per pod);
+- KV events, precise prefix scoring and CPU KV offloading, sized from node RAM;
+- **gate:** measure A9 first (`vllm:prefix_cache_hits_total / vllm:prefix_cache_queries_total` per
+  engine).
 
 ---
 
 ## 8. Open items before production
 
-1. Which sites take part, and their node counts.
-2. The FP4 recipe, including `requestsPerNode`.
-3. Confirm the CRD fields the chart uses against the installed versions (list in FINDINGS, open
-   question 12).
-4. Confirm on the first site that Agent Router's InferencePool cluster keeps the shed circuit
-   breaker. Agent Router rewrites that cluster, and this could not be proven from source.
-5. Decide which site hosts the shared rate-limit Valkey (optional).
+1. The model recipes: GLM-5.3 FP4 B200, Kimi K2.7 H200, Qwen3.8 27B. Each sets `requestsPerNode`
+   from vLLM's concurrency log.
+2. Confirm the CRD fields both charts use against the installed versions (FINDINGS, open
+   question 11).
+3. On the first site, confirm the InferencePool cluster keeps the shed circuit breaker, and each
+   fleet cluster lists every site.
+4. Decide which site hosts the shared rate-limit Valkey (optional).
+5. A session header, if consistent hashing is wanted.
