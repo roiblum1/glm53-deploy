@@ -1,4 +1,4 @@
-# Per-cluster values. Copy to values/site.yaml and replace every value.
+# Per-cluster values. Copy to values/sites/<cluster>.yaml and replace every value.
 
 global:
   imageRegistry: REGISTRY            # internal registry host[/project]
@@ -25,14 +25,11 @@ route:
 argocd:
   enabled: true
 
-rateLimit:
-  enabled: true                      # needs the Envoy Gateway rate limit service + Redis
-  clientHeader: x-tenant-id
-  tokens: 2000000
-  unit: Hour
+# No rateLimit here: with crossSite the model chart does not meter. Budgets are
+# set once for the fleet in values/fleet.yaml.
 
 healthRoute:
-  enabled: true                      # GSLB monitor: GET /healthz/glm-5.3
+  enabled: true                      # the fleet's tier 0 health-checks GET /healthz/glm-5.3
 
 benchmark:
   enabled: true

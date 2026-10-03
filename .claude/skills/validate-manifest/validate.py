@@ -250,6 +250,7 @@ for m in sorted({m for m in seen_models if seen_models.count(m) > 1}):
     errors.append(f"model {m!r} has more than one tier-0 route")
 
 # --- cross-site: fleet tier 0 ------------------------------------------------------
+t0s_by_name = {dig(r, "metadata", "name"): r for r in tier0_routes}
 for t0 in tier0_routes:
     if None in section(t0):
         errors.append(f"{name(t0)}: no sectionName; the tier-0 route would also attach to the peer listener and loop")
@@ -283,6 +284,25 @@ for t0 in tier0_routes:
         if len(refs) > 1:
             errors.append(f"{name(t0)} rule {rule.get('name')!r}: {len(refs)} backendRefs — each is its own locality, picked "
                           "by weight first; list sites as endpoints of one Backend so least-request and hashing compare sites")
+
+# A Distinct client header only identifies the client if the gateway writes it.
+forwarded = {}
+for sp in of_kind("SecurityPolicy"):
+    header = dig(sp, "spec", "apiKeyAuth", "forwardClientIDHeader")
+    for ref in dig(sp, "spec", "targetRefs", default=[]):
+        forwarded.setdefault(ref.get("name"), set()).add(header)
+    if dig(sp, "spec", "apiKeyAuth") and not dig(sp, "spec", "apiKeyAuth", "credentialRefs"):
+        errors.append(f"{name(sp)}: apiKeyAuth without credentialRefs")
+for btp in of_kind("BackendTrafficPolicy") if fleet_mode else []:
+    for ref in dig(btp, "spec", "targetRefs", default=[]):
+        for i, rule in enumerate(dig(btp, "spec", "rateLimit", "global", "rules", default=[])):
+            for sel in rule.get("clientSelectors", []):
+                for h in sel.get("headers", []):
+                    if h.get("type") == "Distinct" and h.get("name") not in forwarded.get(ref.get("name"), set()):
+                        warns.append(f"{name(btp)} rule {i}: budget counts on header {h.get('name')!r} but no SecurityPolicy on "
+                                     f"route {ref.get('name')} writes it — clients can forge it, or omit it and go unlimited")
+            if len(dig(t0s_by_name.get(ref.get("name"), {}), "spec", "rules", default=[])) > 1 and not rule.get("shared"):
+                warns.append(f"{name(btp)} rule {i}: not shared — each route rule (pin-<site>, pool) gets its own budget")
 
 # --- cross-site: serving side of a model release -----------------------------------
 # Peer mode: the serving route stops metering and the health route is on two listeners.

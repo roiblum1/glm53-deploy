@@ -15,3 +15,21 @@ sites:
   - {name: site2, address: llm.site2.example.internal}
   - {name: site3, address: llm.site3.example.internal}
   - {name: site4, address: llm.site4.example.internal}
+
+# Token budget per client, per model, for the whole fleet: every cluster's rate
+# limit service uses the one Redis on the hub (values/envoy-gateway.example.yaml).
+# Override per model with models[].rateLimit.
+fleet:
+  # Customers authenticate with an API key; the gateway turns it into
+  # x-tenant-id. Without this, a request with no x-tenant-id is not limited.
+  auth:
+    apiKey:
+      enabled: true
+      secretNames:
+        - llm-api-keys                 # Secret in the fleet namespace, the same on every cluster
+  defaults:
+    rateLimit:
+      enabled: true
+      clientHeader: x-tenant-id        # set by the gateway from the API key, never by the client
+      tokens: 2000000
+      unit: Hour

@@ -88,10 +88,16 @@ fleet:
       - {metadataKey: llm_total_token, type: TotalToken}
     # Per-client token budget per model, charged once at the entry site. Needs
     # the Envoy Gateway rate limit service; point every cluster's at one
-    # Redis/Valkey for fleet-wide budgets. Fails open: a limiter outage lapses
-    # budgets, it never stops inference. Never set failClosed.
+    # Redis/Valkey for fleet-wide budgets (values/envoy-gateway.example.yaml).
+    # Fails open: a limiter outage lapses budgets, it never stops inference.
+    # Never set failClosed.
     rateLimit:
       enabled: false
+      # One bucket per client for the whole model route. Without it Envoy
+      # Gateway keys the counter on the route RULE, so every pin-<site> rule
+      # and the pool rule each get their own budget and a client sending
+      # x-site-pin spends (sites + 1) x tokens.
+      shared: true
       # Written by the gateway from the verified credential, stripped from
       # client input; otherwise anyone can pick another tenant's budget.
       clientHeader: x-tenant-id
@@ -99,6 +105,23 @@ fleet:
       unit: Hour
       costKey: llm_total_token
       extraRules: []
+  # Customer API keys, checked on every model route. Envoy writes the client ID
+  # of the matching key into the budget's client header (rateLimit.clientHeader),
+  # overwriting whatever the client sent.
+  auth:
+    apiKey:
+      enabled: false
+      # Opaque Secrets in the release namespace, the same on every cluster: one
+      # entry per customer, entry name = client ID, value = the key. Not created
+      # by the chart. Rotating a key is replacing the value; a new entry name is
+      # a new client with its own budget.
+      secretNames: []
+      # Where the key is read from. "Authorization: Bearer <key>" is accepted,
+      # so OpenAI clients work unchanged.
+      headers:
+        - Authorization
+      # Remove the key before the request goes on to the serving site.
+      sanitize: true
   # 200 at this path on the client listener while the gateway is up: the Avi
   # GSLB monitor. Any gateway can proxy any model, so GSLB monitors the gateway,
   # not a model.

@@ -1,0 +1,66 @@
+# Envoy Gateway install values for the shared token-budget store: one Redis on
+# the hub cluster, used by every site's rate limit service. NOT read by chart/
+# or fleet/: merge it into the values of the Envoy Gateway Helm release on every
+# site, next to what is already there (extensionManager, enableBackend, ...).
+# Field names read from Envoy Gateway v1.8.5 source; confirm against the
+# installed version.
+#
+# The Redis itself is deployed outside these charts. Expose it from the hub as
+# a LoadBalancer Service (AKO L4 VIP), not an OpenShift Route.
+#
+# One budget for the fleet needs the SAME counter key on every site. Envoy
+# Gateway builds it from the fleet release's policy namespace and name, so on
+# every site keep identical:
+#   - the fleet release name and namespace
+#   - values/fleet.yaml (model order and rateLimit settings)
+# Test: spend a tenant's budget through site1, then expect 429 for the same
+# tenant and model through site2.
+
+config:
+  envoyGateway:
+    rateLimit:
+      backend:
+        type: Redis
+        redis:
+          url: redis.hub.example.internal:6379      # host:port of the hub Redis VIP
+          # Present = the rate limit service speaks TLS to Redis.
+          tls:
+            # Optional client certificate (mTLS). kubernetes.io/tls Secret in
+            # the Envoy Gateway namespace. Drop certificateRef for server-only TLS.
+            certificateRef:
+              name: ratelimit-redis-client
+      # Envoy -> rate limit service deadline. The default is 20ms, which a
+      # cross-site Redis round trip can miss; a miss fails open, so the request
+      # passes unmetered and nothing looks wrong. It is also the most a slow hub
+      # can add to a request.
+      timeout: 250ms
+      # Fail open: a hub outage lapses budgets, it never stops inference.
+      failClosed: false
+
+    provider:
+      type: Kubernetes
+      kubernetes:
+        # Envoy Gateway only passes the URL and the client certificate to the
+        # rate limit service. The Redis password and an internal CA go in as
+        # extra env on its Deployment (envoyproxy/ratelimit settings).
+        rateLimitDeployment:
+          # Counters live in Redis, so replicas are stateless.
+          replicas: 2
+          container:
+            env:
+              - name: REDIS_AUTH
+                valueFrom:
+                  secretKeyRef:
+                    name: ratelimit-redis-auth        # Secret in the Envoy Gateway namespace
+                    key: password
+              - name: REDIS_TLS_CACERT
+                value: /redis-ca/ca.crt
+            volumeMounts:
+              - name: redis-ca
+                mountPath: /redis-ca
+                readOnly: true
+          pod:
+            volumes:
+              - name: redis-ca
+                configMap:
+                  name: ratelimit-redis-ca            # internal CA that signed the Redis certificate, key ca.crt

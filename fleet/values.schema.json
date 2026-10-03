@@ -62,6 +62,9 @@
                   "Day"
                 ]
               },
+              "shared": {
+                "type": "boolean"
+              },
               "costKey": {
                 "type": "string"
               },
@@ -252,6 +255,9 @@
                     "Day"
                   ]
                 },
+                "shared": {
+                  "type": "boolean"
+                },
                 "costKey": {
                   "type": "string"
                 },
@@ -271,6 +277,40 @@
             "path": {
               "type": "string",
               "pattern": "^/"
+            }
+          }
+        },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "apiKey": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "secretNames": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                },
+                "headers": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "sanitize": {
+                  "type": "boolean"
+                }
+              }
             }
           }
         }

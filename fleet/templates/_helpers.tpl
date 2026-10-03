@@ -85,6 +85,9 @@ rateLimit:
               - name: x-ai-eg-model
                 type: Exact
                 value: {{ .model.name }}
+        {{- if $limit.shared }}
+        shared: true
+        {{- end }}
         limit:
           requests: {{ int64 $limit.tokens }}
           unit: {{ $limit.unit }}

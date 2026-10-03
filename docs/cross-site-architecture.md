@@ -175,6 +175,7 @@ least-request: it needs no node counts, and it adapts to what the gateway sees.
                                    |
   +---------- Agent Router, client listener (https): FLEET release, same on every cluster --------+
   |  per model m:                                                                                  |
+  |    SecurityPolicy fleet-<m>:  API key -> x-tenant-id (the customer)                            |
   |    AIGatewayRoute fleet-<m>:  pin-<site> rules (x-site-pin) | pool -> AIServiceBackend          |
   |                                                              fleet-all-sites (every site = 1   |
   |                                                              endpoint, one locality)           |
@@ -182,7 +183,7 @@ least-request: it needs no node counts, and it adapts to what the gateway sees.
   |      loadBalancer LeastRequest (or ConsistentHash on a header, off)                            |
   |      healthCheck GET /healthz/<m> on every site  -> membership; panicThreshold 0               |
   |      retry 503/connect-failure/reset, up to sites-1, each to a different site                  |
-  |      token metering + budget for m (entry site, once)                                          |
+  |      token metering + budget per customer for m (entry site, once; counters in the hub Redis)  |
   |  /healthz/gateway -> 200 (directResponse)                                                      |
   +-----------------------------------------------+-----------------------------------------------+
                                                   | mTLS (client cert), SNI = shared hostname
@@ -199,19 +200,23 @@ least-request: it needs no node counts, and it adapts to what the gateway sees.
 
 1. **DNS.** The client resolves `llm.<domain>`; Avi returns a VIP of any site whose gateway is up
    (round robin).
-2. **Tier 0.** The entry gateway matches the request's model to that model's fleet route. Envoy
+2. **Authentication.** The entry gateway checks the request's API key and writes the customer's
+   ID into `x-tenant-id`, replacing anything the client sent. An unknown key gets 401. If that
+   customer's budget for the model is already spent, the request gets 429 here.
+3. **Tier 0.** The entry gateway matches the request's model to that model's fleet route. Envoy
    considers only the sites whose `/healthz/<model>` currently answers 200: the sites serving it,
    possibly the entry site itself. It picks two at random and sends to the one with fewer requests
    in flight from this gateway replica.
-3. **The hop.** The request goes over mTLS to that site's peer listener and the model release's
+4. **The hop.** The request goes over mTLS to that site's peer listener and the model release's
    serving route.
-4. **Shed or serve.** Under the site's in-flight limit, the request goes to the InferencePool, the
+5. **Shed or serve.** Under the site's in-flight limit, the request goes to the InferencePool, the
    EPP picks a node, then vLLM. Over the limit, the site answers 503 immediately.
-5. **Retry.** On a 503, connect failure or reset, tier 0 retries a different site serving the
+6. **Retry.** On a 503, connect failure or reset, tier 0 retries a different site serving the
    model, up to `sites − 1` times, with a 100 ms to 1 s backoff. It retries only before any response
    bytes, so a stream is never duplicated.
-6. **Metering.** Tier 0 reads token usage from the response and charges the tenant's budget for that
-   model, once, at the entry site.
+7. **Metering.** Tier 0 reads token usage from the response and charges the customer's budget for
+   that model, once, at the entry site. The counter lives in the Redis on the hub, so it is the
+   same counter whichever site the customer enters through.
 
 ### 4.2 Component by component: what, and why
 
@@ -228,7 +233,9 @@ least-request: it needs no node counts, and it adapts to what the gateway sees.
 | **Retry at the sender** | `numRetries` = sites − 1, `previous_hosts` | A shed request reaches every other site before failing. Bounded, so a saturated fleet returns 503 instead of looping. |
 | **Busy and dead are separate** | Health checks remove; shedding only refuses one request | A loaded site is never marked down, so load can't cascade into an outage. |
 | **Raised tier-0 limits** | `fleet.maxParallelRequests` | Envoy's default 1024 per replica would cap a model fleet-wide through one entry gateway. |
-| **Metering at entry** | `llmRequestCosts` + budget on the fleet routes; none on serving routes | Charged once. For fleet-wide budgets, point every site's rate limit service at one Valkey. It fails open: lapsed budgets beat a fleet outage. |
+| **API keys** | `SecurityPolicy` per model route (`fleet.auth.apiKey`); keys in a Secret, one entry per customer | The gateway derives `x-tenant-id` from the key, so a customer can't forge a tenant or skip the limit by omitting the header. Per route, not per listener, so the Avi monitor needs no key. |
+| **Metering at entry** | `llmRequestCosts` + budget on the fleet routes; none on serving routes | Charged once. It fails open: lapsed budgets beat a fleet outage. |
+| **One budget fleet-wide** | Every site's rate limit service uses one Redis on the hub; the rule is `shared` | Envoy Gateway keys a counter on the route rule by default, which would give each `pin-<site>` rule its own budget. A shared rule is keyed on the policy's namespace and name, which are identical on every site, so all sites and all rules count into one bucket per customer and model. |
 | **Gateway health for GSLB** | `/healthz/gateway`, answered by Envoy | Any gateway can proxy any model, so GSLB monitors the gateway. Per-model health is tier 0's job. |
 | **`x-site-pin`** | Per-site rules with an extra header match | Model releases' benchmark hooks pin to their own site, so a rolling upgrade is gated per site. Also useful for debugging. |
 | **Consistent hashing (off)** | `models[].hashHeader` | Keeps a conversation on one site, and a retry steps to a stable second site. Off until clients send a session header. Never hash on the tenant. |
@@ -245,7 +252,10 @@ least-request: it needs no node counts, and it adapts to what the gateway sees.
 | m down on a site | It fails m's health check within ~15 s and leaves m's pool; other models on that site are unaffected. |
 | A site's gateway down | Connect failures are retried elsewhere at once, and health checks remove it from every model. Avi stops sending entry traffic there. |
 | The entry gateway restarts | Streams entering there are cut, wherever they were served (two gateways per stream). |
-| Rate-limit Valkey down | Budgets lapse (fail open); inference continues; alerts fire. |
+| Hub Redis down or slow | Budgets lapse (fail open); inference continues; alerts fire. Slow counts too: past `rateLimit.timeout` the request passes unmetered. |
+| Unknown or revoked API key | 401 at the entry gateway; nothing reaches a model. |
+| A customer's budget spent | The request that crosses it completes; the next ones get 429 at any site until the window resets. |
+| A client sends `x-tenant-id` itself | Overwritten with the key's client ID. |
 
 ---
 
@@ -264,6 +274,11 @@ sites:
   - {name: site2, address: llm.site2.<domain>}
   - {name: site3, address: llm.site3.<domain>}
   - {name: site4, address: llm.site4.<domain>}
+fleet:
+  auth:
+    apiKey: {enabled: true, secretNames: [llm-api-keys]}   # customers' keys, same Secret on every cluster
+  defaults:
+    rateLimit: {enabled: true, clientHeader: x-tenant-id, tokens: 2000000, unit: Hour}
 ```
 
 **Per model** (`values/<model>-<hw>.yaml`): the recipe, plus
@@ -296,7 +311,10 @@ globalName:                     # read by the fleet chart
 - a `ClientTrafficPolicy` requiring client certificates on it;
 - the CA and client certificate;
 - `enableBackend: true`;
-- an Avi monitor on `/healthz/gateway`.
+- an Avi monitor on `/healthz/gateway`;
+- the Envoy Gateway rate limit service pointed at the hub Redis, with a raised timeout
+  (`values/envoy-gateway.example.yaml`);
+- the API-key Secret, identical on every cluster.
 
 **Safety nets:**
 - **Both charts refuse to render** on:
@@ -356,5 +374,10 @@ globalName:                     # read by the fleet chart
    question 11).
 3. On the first site, confirm the InferencePool cluster keeps the shed circuit breaker, and each
    fleet cluster lists every site.
-4. Decide which site hosts the shared rate-limit Valkey (optional).
-5. A session header, if consistent hashing is wanted.
+4. The Redis on the hub: deployed outside these charts, exposed as a LoadBalancer Service, with
+   TLS and a password. Then the cross-site budget test: spend a customer's budget through one
+   site and expect 429 through another.
+5. How the API-key Secret is distributed to every cluster, and who issues keys.
+6. On the first site: a forged `x-tenant-id` is charged to the key's own client ID, and
+   `Authorization: Bearer <key>` is accepted.
+7. A session header, if consistent hashing is wanted.

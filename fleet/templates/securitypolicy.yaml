@@ -1,0 +1,49 @@
+{{- /*
+API key authentication on every model route. Envoy checks the key against the
+Secrets in credentialRefs (entry name = client ID, value = key), then writes the
+client ID into the budget's client header, replacing anything the client sent.
+That is what makes the token budget per customer and unforgeable.
+
+One SecurityPolicy per model route, not one on the listener: the gateway health
+route stays open for the Avi monitor.
+*/ -}}
+{{- $auth := .Values.fleet.auth.apiKey -}}
+{{- if and .Values.models $auth.enabled }}
+{{- $root := . -}}
+{{- $defaults := .Values.fleet.defaults.rateLimit -}}
+{{- if lt (len $auth.secretNames) 1 }}
+{{- fail "fleet.auth.apiKey.secretNames is empty: name at least one Secret holding the customers' keys" }}
+{{- end }}
+{{- range .Values.models }}
+{{- $id := include "fleet.modelId" . }}
+{{- $limit := mergeOverwrite (deepCopy $defaults) (.rateLimit | default dict) }}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: {{ $root.Release.Name }}-{{ $id }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "fleet.labels" $root | nindent 4 }}
+  {{- with include "fleet.annotations" (dict "root" $root "wave" "policy") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: {{ $root.Release.Name }}-{{ $id }}
+  apiKeyAuth:
+    credentialRefs:
+      {{- range $auth.secretNames }}
+      - name: {{ . }}
+      {{- end }}
+    extractFrom:
+      - headers:
+          {{- toYaml $auth.headers | nindent 10 }}
+    # The header this model's budget counts on.
+    forwardClientIDHeader: {{ $limit.clientHeader }}
+    sanitize: {{ $auth.sanitize }}
+{{- end }}
+{{- end }}
