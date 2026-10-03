@@ -1,189 +1,15 @@
 {{- /*
-Tier 0: every site's gateway spreads this model's requests over all sites,
-itself included, so the fleet behaves as one pool of GPUs.
+Serving side of cross-site pooling. With crossSite on, the serving route moves to
+the peer listener (aigatewayroute.yaml) and stops metering; tier 0, metering and
+per-model membership live in the fleet release (fleet/), one per cluster.
 
-client -> any site's client listener -> tier-0 AIGatewayRoute (<fullname>-sites)
-       -> one AIServiceBackend per site -> that site's peer listener (mTLS)
-       -> serving AIGatewayRoute (<fullname>) -> InferencePool -> EPP -> vLLM
-
-Envoy-native, no picker:
-- Envoy Gateway merges the rule's backendRefs into one cluster, one locality per
-  site, weighted by crossSite.sites[].weight. Requires every site address to be
-  a hostname (an IP splits the cluster per site and breaks cross-site retry).
-- Each site sheds at its own serving route (circuit breaker -> 503). The tier-0
-  retry policy re-sends a 503 / connect failure / reset to another site; the
-  previous_hosts predicate keeps it off the site that just failed.
-- Active health checks on healthRoute's path take a dead site out within
-  interval x unhealthyThreshold. panicThreshold 0: never route to unhealthy
-  sites, even when most are down.
-- Metering and the token budget live here, at the entry site, once.
-- Pin rules: x-site-pin: <site> sends to that site only (benchmark, debugging).
+This site's shed point: past requestsPerNode x len(nodes) in-flight requests
+(split across the gateway's Envoy replicas) the gateway answers 503 at once and
+the sender's tier 0 retries another site, instead of vLLM queueing without bound.
 */ -}}
 {{- if and .Values.serving.enabled .Values.route.enabled .Values.crossSite.enabled }}
 {{- $fullname := include "kserve-llm.fullname" . -}}
-{{- $cs := .Values.crossSite -}}
 {{- $v := include "kserve-llm.crossSite" . | fromYaml -}}
-{{- $root := . -}}
-{{- range $cs.sites }}
----
-apiVersion: gateway.envoyproxy.io/v1alpha1
-kind: Backend
-metadata:
-  name: {{ $fullname }}-site-{{ .name }}
-  namespace: {{ $root.Release.Namespace }}
-  labels:
-    {{- include "kserve-llm.labels" $root | nindent 4 }}
-    app.kubernetes.io/component: cross-site
-  {{- with include "kserve-llm.annotations" (dict "root" $root "wave" "policy") }}
-  annotations:
-    {{- . | nindent 4 }}
-  {{- end }}
-spec:
-  endpoints:
-    - fqdn:
-        hostname: {{ .address }}
-        port: {{ .port | default $cs.port }}
-  tls:
-    sni: {{ $v.hostname }}
-    caCertificateRefs:
-      - group: ""
-        kind: {{ $cs.tls.caCertificateRef.kind }}
-        name: {{ required "crossSite.tls.caCertificateRef.name is required (CA that signed the peer listeners' certificates, key ca.crt)" $cs.tls.caCertificateRef.name }}
-    clientCertificateRef:
-      name: {{ required "crossSite.tls.clientCertificateSecret is required (kubernetes.io/tls Secret this gateway presents to peers)" $cs.tls.clientCertificateSecret }}
----
-apiVersion: aigateway.envoyproxy.io/v1beta1
-kind: AIServiceBackend
-metadata:
-  name: {{ $fullname }}-site-{{ .name }}
-  namespace: {{ $root.Release.Namespace }}
-  labels:
-    {{- include "kserve-llm.labels" $root | nindent 4 }}
-    app.kubernetes.io/component: cross-site
-  {{- with include "kserve-llm.annotations" (dict "root" $root "wave" "policy") }}
-  annotations:
-    {{- . | nindent 4 }}
-  {{- end }}
-spec:
-  schema:
-    name: OpenAI
-  backendRef:
-    group: gateway.envoyproxy.io
-    kind: Backend
-    name: {{ $fullname }}-site-{{ .name }}
-{{- end }}
----
-apiVersion: aigateway.envoyproxy.io/v1beta1
-kind: AIGatewayRoute
-metadata:
-  name: {{ $fullname }}-sites
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "kserve-llm.labels" . | nindent 4 }}
-    app.kubernetes.io/component: cross-site
-  {{- with include "kserve-llm.annotations" (dict "root" . "wave" "route") }}
-  annotations:
-    {{- . | nindent 4 }}
-  {{- end }}
-spec:
-  parentRefs:
-    - group: gateway.networking.k8s.io
-      kind: Gateway
-      name: {{ .Values.route.gateway.name }}
-      namespace: {{ .Values.route.gateway.namespace }}
-      {{- with .Values.route.gateway.sectionName }}
-      sectionName: {{ . }}
-      {{- end }}
-  rules:
-    {{- range $cs.sites }}
-    # Pinned: more header matches than the pooled rule, so it wins when the header is set.
-    - name: pin-{{ .name }}
-      matches:
-        - headers:
-            - type: Exact
-              name: x-ai-eg-model
-              value: {{ $root.Values.model.name }}
-            - type: Exact
-              name: {{ $cs.pinHeader }}
-              value: {{ .name }}
-      backendRefs:
-        - name: {{ $fullname }}-site-{{ .name }}
-      timeouts:
-        request: {{ $root.Values.route.requestTimeout }}
-    {{- end }}
-    - name: pool
-      matches:
-        - headers:
-            - type: Exact
-              name: x-ai-eg-model
-              value: {{ .Values.model.name }}
-      backendRefs:
-        {{- range $cs.sites }}
-        - name: {{ $fullname }}-site-{{ .name }}
-          weight: {{ .weight }}
-        {{- end }}
-      timeouts:
-        request: {{ .Values.route.requestTimeout }}
-  {{- with .Values.route.llmRequestCosts }}
-  llmRequestCosts:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
----
-# One policy per route: retry, health, limits and the token budget together.
-apiVersion: gateway.envoyproxy.io/v1alpha1
-kind: BackendTrafficPolicy
-metadata:
-  name: {{ $fullname }}-sites
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "kserve-llm.labels" . | nindent 4 }}
-    app.kubernetes.io/component: cross-site
-  {{- with include "kserve-llm.annotations" (dict "root" . "wave" "policy") }}
-  annotations:
-    {{- . | nindent 4 }}
-  {{- end }}
-spec:
-  targetRefs:
-    - group: gateway.networking.k8s.io
-      kind: HTTPRoute
-      name: {{ $fullname }}-sites
-  retry:
-    numRetries: {{ $cs.retry.numRetries }}
-    retryOn:
-      triggers:
-        - connect-failure
-        - reset
-        - retriable-status-codes
-      httpStatusCodes:
-        - 503
-    perRetry:
-      backOff:
-        baseInterval: {{ $cs.retry.baseInterval }}
-        maxInterval: {{ $cs.retry.maxInterval }}
-  healthCheck:
-    panicThreshold: 0
-    active:
-      type: HTTP
-      interval: {{ $cs.healthCheck.interval }}
-      timeout: {{ $cs.healthCheck.timeout }}
-      unhealthyThreshold: {{ $cs.healthCheck.unhealthyThreshold }}
-      healthyThreshold: {{ $cs.healthCheck.healthyThreshold }}
-      http:
-        hostname: {{ $v.hostname }}
-        path: {{ .Values.healthRoute.path | default (printf "/healthz/%s" .Values.model.name) }}
-        expectedStatuses:
-          - 200
-  # Envoy's default 1024 per replica would cap the whole fleet; each site sheds itself.
-  circuitBreaker:
-    maxConnections: {{ int64 $cs.maxParallelRequests }}
-    maxPendingRequests: {{ int64 $cs.maxParallelRequests }}
-    maxParallelRequests: {{ int64 $cs.maxParallelRequests }}
-  {{- if .Values.rateLimit.enabled }}
-  {{- include "kserve-llm.rateLimit" . | nindent 2 }}
-  {{- end }}
----
-# This site's shed point. Past it, the gateway answers 503 at once and the
-# sender's tier 0 retries another site, instead of vLLM queueing without bound.
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: BackendTrafficPolicy
 metadata:
@@ -204,5 +30,5 @@ spec:
   circuitBreaker:
     maxConnections: {{ $v.servingMaxParallel }}
     maxParallelRequests: {{ $v.servingMaxParallel }}
-    maxPendingRequests: {{ $cs.serving.maxPendingRequests }}
+    maxPendingRequests: {{ .Values.crossSite.serving.maxPendingRequests }}
 {{- end }}

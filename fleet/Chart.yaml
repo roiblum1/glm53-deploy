@@ -1,0 +1,13 @@
+apiVersion: v2
+name: kserve-llm-fleet
+description: >-
+  Tier 0 for a fleet of sites serving several models behind one name: one
+  Agent Router (Envoy AI Gateway) route per model that spreads requests over
+  every site serving it. One identical release per cluster; the model releases
+  (chart/) only serve.
+type: application
+version: 0.1.0
+keywords:
+  - envoy-ai-gateway
+  - multi-site
+  - gslb

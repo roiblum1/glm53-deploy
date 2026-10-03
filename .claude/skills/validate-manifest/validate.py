@@ -127,10 +127,22 @@ for n in sorted(nodes - set(job_nodes)):
 for n in sorted({n for n in job_nodes if job_nodes.count(n) > 1}):
     errors.append(f"node {n!r} has more than one pull Job")
 
+# --- mode ------------------------------------------------------------------------
+# Model render (chart/): one LLMInferenceService and its serving route.
+# Fleet render (fleet/): no LLMInferenceService, tier-0 routes to AIServiceBackends only.
+
+
+def is_tier0(route):
+    refs = [b for rule in dig(route, "spec", "rules", default=[]) for b in rule.get("backendRefs", [])]
+    return bool(refs) and all(b.get("kind") in (None, "AIServiceBackend") for b in refs)
+
+
+fleet_mode = not of_kind("LLMInferenceService") and any(is_tier0(r) for r in of_kind("AIGatewayRoute"))
+
 # --- LLMInferenceService -------------------------------------------------------
 FORBIDDEN_FLAGS = {"--model", "--port", "--served-model-name"}
 llmisvcs = of_kind("LLMInferenceService")
-if len(llmisvcs) != 1:
+if len(llmisvcs) != 1 and not fleet_mode:
     errors.append(f"expected exactly one LLMInferenceService, found {len(llmisvcs)}")
 
 for svc in llmisvcs:
@@ -193,23 +205,26 @@ def section(route):
     return {r.get("sectionName") for r in dig(route, "spec", "parentRefs", default=[])}
 
 
-def is_tier0(route):
-    refs = [b for rule in dig(route, "spec", "rules", default=[]) for b in rule.get("backendRefs", [])]
-    return bool(refs) and all(b.get("kind") in (None, "AIServiceBackend") for b in refs)
-
-
 tier0_routes = [r for r in of_kind("AIGatewayRoute") if is_tier0(r)]
 serving_routes = [r for r in of_kind("AIGatewayRoute") if not is_tier0(r)]
 ai_backends = {dig(b, "metadata", "name"): b for b in of_kind("AIServiceBackend")}
 backends = {dig(b, "metadata", "name"): b for b in of_kind("Backend")}
 
+if tier0_routes and not fleet_mode:
+    errors.append("tier-0 routes in a model render: tier 0 belongs to the fleet release (fleet/)")
+route_models = {}
 for route in of_kind("AIGatewayRoute"):
     tier0 = route in tier0_routes
     for i, rule in enumerate(dig(route, "spec", "rules", default=[])):
         where = f"{name(route)} rule {i}"
         models = [h.get("value") for m in rule.get("matches", []) for h in m.get("headers", [])
                   if h.get("name") == "x-ai-eg-model"]
-        if model_name not in models:
+        if fleet_mode:
+            if len(models) != 1:
+                errors.append(f"{where}: x-ai-eg-model matches {models}, expected exactly one model")
+            else:
+                route_models.setdefault(name(route), set()).add(models[0])
+        elif model_name not in models:
             errors.append(f"{where}: x-ai-eg-model matches {models}, llmisvc model.name is {model_name!r}")
         if tier0:
             for b in rule.get("backendRefs", []):
@@ -227,7 +242,14 @@ for route in of_kind("AIGatewayRoute"):
             notes.append(f"{name(route)}: cross-namespace parentRef to {ref_ns}/{ref.get('name')} — "
                          f"its listener allowedRoutes must admit {dig(route, 'metadata', 'namespace')}")
 
-# --- cross-site tier 0 ---------------------------------------------------------
+for rname, ms in route_models.items():
+    if len(ms) > 1:
+        errors.append(f"{rname}: rules match different models {sorted(ms)}; one route per model")
+seen_models = [m for ms in route_models.values() for m in ms]
+for m in sorted({m for m in seen_models if seen_models.count(m) > 1}):
+    errors.append(f"model {m!r} has more than one tier-0 route")
+
+# --- cross-site: fleet tier 0 ------------------------------------------------------
 for t0 in tier0_routes:
     if None in section(t0):
         errors.append(f"{name(t0)}: no sectionName; the tier-0 route would also attach to the peer listener and loop")
@@ -254,6 +276,31 @@ for asb_name, asb in ai_backends.items():
     ref = dig(asb, "spec", "backendRef", "name")
     if ref not in backends:
         errors.append(f"AIServiceBackend/{asb_name}: backendRef {ref!r} has no Backend in the render")
+fleet_sites = max((len(dig(b, "spec", "endpoints", default=[])) for b in backends.values()), default=0)
+for t0 in tier0_routes:
+    for rule in dig(t0, "spec", "rules", default=[]):
+        refs = rule.get("backendRefs", [])
+        if len(refs) > 1:
+            errors.append(f"{name(t0)} rule {rule.get('name')!r}: {len(refs)} backendRefs — each is its own locality, picked "
+                          "by weight first; list sites as endpoints of one Backend so least-request and hashing compare sites")
+
+# --- cross-site: serving side of a model release -----------------------------------
+# Peer mode: the serving route stops metering and the health route is on two listeners.
+peer_mode = (not fleet_mode and bool(serving_routes)
+             and not any(dig(r, "spec", "llmRequestCosts") for r in serving_routes)
+             and any(len(dig(h, "spec", "parentRefs", default=[])) > 1 for h in of_kind("HTTPRoute")))
+if (not fleet_mode and any(dig(r, "spec", "llmRequestCosts") for r in serving_routes)
+        and any(len(dig(h, "spec", "parentRefs", default=[])) > 1 for h in of_kind("HTTPRoute"))):
+    errors.append("crossSite is on (health route on two listeners) but the serving route still meters — "
+                  "the fleet's tier 0 already charges, so tokens would be charged twice")
+if peer_mode:
+    for sr in serving_routes:
+        shed = [b for b in of_kind("BackendTrafficPolicy")
+                if any(ref.get("name") == dig(sr, "metadata", "name") for ref in dig(b, "spec", "targetRefs", default=[]))
+                and dig(b, "spec", "circuitBreaker", "maxParallelRequests")]
+        if not shed:
+            errors.append(f"{name(sr)}: serving on the peer listener without a shed policy — a full site queues in vLLM "
+                          "instead of answering 503 for the sender to retry elsewhere")
 
 # --- rate limit ----------------------------------------------------------------
 route_names = {dig(r, "metadata", "name") for r in of_kind("AIGatewayRoute")}
@@ -267,12 +314,26 @@ for (kind, target), owners in policy_targets.items():
     if len(owners) > 1:
         errors.append(f"{kind}/{target} is targeted by several BackendTrafficPolicies {owners}; only one takes effect")
 tier0_names = {dig(r, "metadata", "name") for r in tier0_routes}
+tier0_policies = set()
 for btp in of_kind("BackendTrafficPolicy"):
-    if any(ref.get("name") in tier0_names for ref in dig(btp, "spec", "targetRefs", default=[])):
+    targets = {ref.get("name") for ref in dig(btp, "spec", "targetRefs", default=[])}
+    if targets & tier0_names:
+        tier0_policies |= targets & tier0_names
         if not dig(btp, "spec", "retry"):
             errors.append(f"{name(btp)}: tier-0 policy without retry — a site shedding 503 fails the request instead of moving it")
+        retries = dig(btp, "spec", "retry", "numRetries")
+        if retries is not None and fleet_sites and retries > fleet_sites - 1:
+            errors.append(f"{name(btp)}: numRetries {retries} > sites-1 ({fleet_sites - 1})")
+        elif retries is not None and fleet_sites and retries < fleet_sites - 1:
+            warns.append(f"{name(btp)}: numRetries {retries} < sites-1 ({fleet_sites - 1}) — a request can fail while a site is free")
         if dig(btp, "spec", "healthCheck", "panicThreshold") != 0:
             warns.append(f"{name(btp)}: healthCheck.panicThreshold is not 0 — with most sites down Envoy routes to dead ones")
+        if not dig(btp, "spec", "healthCheck", "active", "http", "path"):
+            errors.append(f"{name(btp)}: no active HTTP health check — membership (which sites serve the model) comes from it")
+        if not dig(btp, "spec", "loadBalancer", "type"):
+            warns.append(f"{name(btp)}: no loadBalancer.type — Envoy Gateway's default applies (least-request)")
+for t0 in sorted(tier0_names - tier0_policies):
+    errors.append(f"AIGatewayRoute/{t0}: no BackendTrafficPolicy — no retry, no health checks, Envoy's 1024 request cap")
 for btp in of_kind("BackendTrafficPolicy"):
     for ref in dig(btp, "spec", "targetRefs", default=[]):
         if ref.get("kind") == "Gateway":
@@ -298,8 +359,8 @@ for job in of_kind("Job"):
     args = [a for c in pod.get("containers", []) for a in c.get("args", [])]
     if not any(a.startswith("--tokenizer=/") for a in args):
         errors.append(f"{name(job)}: no local --tokenizer path (AIPerf would fetch it from Hugging Face)")
-    if tier0_routes and not any(a == "--header" for a in args):
-        errors.append(f"{name(job)}: tier 0 is on but the benchmark is not pinned to this site; it would measure the fleet")
+    if peer_mode and not any(a == "--header" for a in args):
+        errors.append(f"{name(job)}: crossSite is on but the benchmark is not pinned to this site; it would measure the fleet")
     hooks = dig(job, "metadata", "annotations", default={})
     if "helm.sh/hook" not in hooks:
         errors.append(f"{name(job)}: not a hook; it would run before the model is deployed")
@@ -317,12 +378,16 @@ for rule in of_kind("GSLBHostRule"):
         warns.append(f"{name(rule)}: health monitors set but healthRoute is off, so there is no model health path to probe")
 serving_sections = set().union(*[section(r) for r in serving_routes]) if serving_routes else set()
 for hr in of_kind("HTTPRoute"):
-    if tier0_routes and not (section(hr) & serving_sections):
-        errors.append(f"{name(hr)}: not attached to the peer listener {sorted(serving_sections)}; tier 0 health checks would fail")
-    if tier0_routes:
-        for rule in of_kind("GSLBHostRule"):
-            if dig(rule, "spec", "poolAlgorithmSettings", "lbAlgorithm") == "GSLB_ALGORITHM_CONSISTENT_HASH":
-                warns.append(f"{name(rule)}: consistent hash with tier 0 on — entry concentrates on few sites; use round robin")
+    if peer_mode and not (section(hr) & serving_sections):
+        errors.append(f"{name(hr)}: not attached to the peer listener {sorted(serving_sections)}; the fleet's health checks would fail")
+for rule in of_kind("GSLBHostRule"):
+    if fleet_mode and dig(rule, "spec", "poolAlgorithmSettings", "lbAlgorithm") == "GSLB_ALGORITHM_CONSISTENT_HASH":
+        warns.append(f"{name(rule)}: consistent hash with tier 0 — entry concentrates on few sites; use round robin")
+    gateway_health = [r for r in of_kind("HTTPRoute")
+                      if any(f.get("type") == "ExtensionRef" for rr in dig(r, "spec", "rules", default=[])
+                             for f in rr.get("filters", []))]
+    if fleet_mode and not gateway_health:
+        warns.append(f"{name(rule)}: no gateway health route — the GSLB monitor has no gateway-level path to probe")
 for h in of_kind("HostRule"):
     if dig(h, "spec", "virtualhost", "fqdn") == dig(h, "spec", "virtualhost", "gslb", "fqdn"):
         errors.append(f"{name(h)}: local and global fqdn are the same")
@@ -349,6 +414,6 @@ if placeholders:
 for label, items in (("ERROR", errors), ("WARN ", warns), ("NOTE ", notes)):
     for item in items:
         print(f"{label} {item}")
-print(f"{'<stdin>' if path == '-' else path}: {len(docs)} documents, nodes {sorted(nodes)}, namespace {sorted(namespaces)} — "
+print(f"{'<stdin>' if path == '-' else path}: {'fleet' if fleet_mode else 'model'} render, {len(docs)} documents, nodes {sorted(nodes)}, namespace {sorted(namespaces)} — "
       f"{len(errors)} error(s), {len(warns)} warning(s)")
 sys.exit(1 if errors else 0)

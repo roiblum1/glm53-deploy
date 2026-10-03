@@ -3,8 +3,8 @@ Per-model health endpoint on the Agent Router gateway, for the GSLB monitor.
 It answers 200 only while this site has a ready replica of the model, so the
 GSLB pulls a site whose gateway is up but whose model is not. A monitor on the
 gateway alone (or on /v1/models, which the gateway answers itself) cannot see that.
-With crossSite on it is also attached to the peer listener: every site's tier 0
-health-checks this site on the same path.
+With crossSite on it is also attached to the peer listener: every site's fleet
+tier 0 health-checks this path to decide whether this site serves the model.
 */ -}}
 {{- if and .Values.serving.enabled .Values.healthRoute.enabled }}
 {{- $fullname := include "kserve-llm.fullname" . -}}

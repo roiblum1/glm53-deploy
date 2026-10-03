@@ -1,0 +1,67 @@
+{{- /*
+Tier 0, one AIGatewayRoute per model on the client listener. Envoy Gateway
+builds one cluster per route rule, so each model gets its own cluster over the
+shared all-sites Backend, with its own health check (= membership) and limits.
+
+Rules: pin-<site> (x-site-pin, more header matches, wins when set), then pool.
+Metering happens here, once, at the entry site; the serving routes behind the
+peer listener charge nothing.
+*/ -}}
+{{- if .Values.models }}
+{{- $cfg := include "fleet.config" . | fromYaml -}}
+{{- $root := . -}}
+{{- $d := .Values.fleet.defaults -}}
+{{- range .Values.models }}
+{{- $id := include "fleet.modelId" . }}
+{{- $model := . }}
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIGatewayRoute
+metadata:
+  name: {{ $root.Release.Name }}-{{ $id }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "fleet.labels" $root | nindent 4 }}
+  {{- with include "fleet.annotations" (dict "root" $root "wave" "route") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $root.Values.route.gateway.name }}
+      namespace: {{ $root.Values.route.gateway.namespace }}
+      sectionName: {{ $cfg.clientListener }}
+  rules:
+    {{- range $root.Values.sites }}
+    - name: pin-{{ .name }}
+      matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: {{ $model.name }}
+            - type: Exact
+              name: {{ $root.Values.crossSite.pinHeader }}
+              value: {{ .name }}
+      backendRefs:
+        - name: {{ $root.Release.Name }}-site-{{ .name }}
+      timeouts:
+        request: {{ $model.requestTimeout | default $d.requestTimeout }}
+    {{- end }}
+    - name: pool
+      matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: {{ $model.name }}
+      backendRefs:
+        - name: {{ $root.Release.Name }}-all-sites
+      timeouts:
+        request: {{ $model.requestTimeout | default $d.requestTimeout }}
+  {{- with ($model.llmRequestCosts | default $d.llmRequestCosts) }}
+  llmRequestCosts:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,67 @@
+{{- /*
+One Backend listing every site as an endpoint: Envoy Gateway turns it into one
+locality, so least-request and consistent hashing choose between sites and a
+retry moves to another site (previous_hosts). Separate backendRefs per site
+would each be their own locality, picked by weight first, leaving least-request
+one host to choose from.
+
+One Backend per site as well, for the x-site-pin rules. Identical TLS everywhere:
+SNI is the shared peer hostname, the client certificate is this cluster's.
+*/ -}}
+{{- if .Values.models }}
+{{- $cfg := include "fleet.config" . | fromYaml -}}
+{{- $root := . -}}
+{{- $cs := .Values.crossSite -}}
+{{- $backends := list (dict "name" (printf "%s-all-sites" .Release.Name) "sites" .Values.sites) -}}
+{{- range .Values.sites }}
+{{- $backends = append $backends (dict "name" (printf "%s-site-%s" $root.Release.Name .name) "sites" (list .)) }}
+{{- end }}
+{{- range $backends }}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: {{ .name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "fleet.labels" $root | nindent 4 }}
+  {{- with include "fleet.annotations" (dict "root" $root "wave" "policy") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  endpoints:
+    {{- range .sites }}
+    - fqdn:
+        hostname: {{ .address }}
+        port: {{ .port | default $cs.port }}
+    {{- end }}
+  tls:
+    sni: {{ $cfg.hostname }}
+    caCertificateRefs:
+      - group: ""
+        kind: {{ $cs.tls.caCertificateRef.kind }}
+        name: {{ required "crossSite.tls.caCertificateRef.name is required (CA that signed the peer listeners' certificates, key ca.crt)" $cs.tls.caCertificateRef.name }}
+    clientCertificateRef:
+      name: {{ required "crossSite.tls.clientCertificateSecret is required (kubernetes.io/tls Secret this gateway presents to peers)" $cs.tls.clientCertificateSecret }}
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIServiceBackend
+metadata:
+  name: {{ .name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "fleet.labels" $root | nindent 4 }}
+  {{- with include "fleet.annotations" (dict "root" $root "wave" "policy") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  schema:
+    name: OpenAI
+  backendRef:
+    group: gateway.envoyproxy.io
+    kind: Backend
+    name: {{ .name }}
+{{- end }}
+{{- end }}

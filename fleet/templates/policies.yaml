@@ -1,0 +1,79 @@
+{{- /*
+One BackendTrafficPolicy per model route (Envoy Gateway applies one per route):
+- loadBalancer: LeastRequest across sites (this replica's view), or
+  ConsistentHash on models[].hashHeader to keep a conversation on one site.
+- retry: a 503 shed, connect failure or reset goes to a different site.
+- healthCheck: membership. A site without the model, or a dead one, fails
+  GET <healthPath> and is out; panicThreshold 0 never routes to unhealthy sites.
+- circuitBreaker raised: each site's shed point is the real limit.
+- rateLimit: the model's token budget, once, at entry.
+*/ -}}
+{{- if .Values.models }}
+{{- $cfg := include "fleet.config" . | fromYaml -}}
+{{- $root := . -}}
+{{- $f := .Values.fleet -}}
+{{- range .Values.models }}
+{{- $id := include "fleet.modelId" . }}
+{{- $limit := mergeOverwrite (deepCopy $f.defaults.rateLimit) (.rateLimit | default dict) }}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: {{ $root.Release.Name }}-{{ $id }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "fleet.labels" $root | nindent 4 }}
+  {{- with include "fleet.annotations" (dict "root" $root "wave" "policy") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: {{ $root.Release.Name }}-{{ $id }}
+  loadBalancer:
+    {{- if .hashHeader }}
+    type: ConsistentHash
+    consistentHash:
+      type: Header
+      header:
+        name: {{ .hashHeader }}
+    {{- else }}
+    type: LeastRequest
+    {{- end }}
+  retry:
+    numRetries: {{ $cfg.numRetries }}
+    retryOn:
+      triggers:
+        - connect-failure
+        - reset
+        - retriable-status-codes
+      httpStatusCodes:
+        - 503
+    perRetry:
+      backOff:
+        baseInterval: {{ $f.retry.baseInterval }}
+        maxInterval: {{ $f.retry.maxInterval }}
+  healthCheck:
+    panicThreshold: 0
+    active:
+      type: HTTP
+      interval: {{ $f.healthCheck.interval }}
+      timeout: {{ $f.healthCheck.timeout }}
+      unhealthyThreshold: {{ $f.healthCheck.unhealthyThreshold }}
+      healthyThreshold: {{ $f.healthCheck.healthyThreshold }}
+      http:
+        hostname: {{ $cfg.hostname }}
+        path: {{ .healthPath | default (printf "/healthz/%s" .name) }}
+        expectedStatuses:
+          - 200
+  circuitBreaker:
+    maxConnections: {{ int64 $f.maxParallelRequests }}
+    maxPendingRequests: {{ int64 $f.maxParallelRequests }}
+    maxParallelRequests: {{ int64 $f.maxParallelRequests }}
+  {{- if $limit.enabled }}
+  {{- include "fleet.rateLimit" (dict "model" . "limit" $limit "costs" (.llmRequestCosts | default $f.defaults.llmRequestCosts)) | nindent 2 }}
+  {{- end }}
+{{- end }}
+{{- end }}

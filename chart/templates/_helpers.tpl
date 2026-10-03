@@ -134,41 +134,26 @@ rateLimit:
 {{- end -}}
 
 {{/*
-Validated crossSite settings as YAML (fromYaml it). Fails the render on anything
-that would make the tier-0 cluster split per site or leave a peer unreachable.
+Validated crossSite settings as YAML (fromYaml it). crossSite puts this release's
+serving route on the peer listener, where the fleet release's tier 0 (fleet/)
+reaches it from every site. Fails the render on anything that would loop
+requests back into tier 0 or expose the unmetered serving route to clients.
 */}}
 {{- define "kserve-llm.crossSite" -}}
 {{- $cs := .Values.crossSite -}}
-{{- $self := required "crossSite.self is required (this site's name in crossSite.sites)" $cs.self -}}
-{{- $peer := required "crossSite.peerListener is required (the mTLS listener peers connect to)" $cs.peerListener -}}
-{{- $client := required "route.gateway.sectionName is required with crossSite: without it the tier-0 route also attaches to the peer listener and peer requests loop back into tier 0" .Values.route.gateway.sectionName -}}
+{{- $self := required "crossSite.self is required (this site's name in values/fleet.yaml sites; the benchmark pins itself to it)" $cs.self -}}
+{{- $peer := required "crossSite.peerListener is required (the mTLS listener the fleet's tier 0 connects to)" $cs.peerListener -}}
+{{- $client := required "route.gateway.sectionName is required with crossSite: it is the fleet's client listener, which must not carry the serving route" .Values.route.gateway.sectionName -}}
 {{- if eq $peer $client }}
 {{- fail "crossSite.peerListener must differ from route.gateway.sectionName: clients would reach the serving route directly, unmetered" }}
 {{- end }}
 {{- if not .Values.healthRoute.enabled }}
-{{- fail "crossSite needs healthRoute.enabled: tier 0 health-checks every site on that path" }}
-{{- end }}
-{{- $hostname := required "crossSite.tls.hostname (or globalName.fqdn) is required: SNI and health-check host sent to every site" ($cs.tls.hostname | default .Values.globalName.fqdn) -}}
-{{- $names := list -}}
-{{- range $cs.sites }}
-{{- $n := required "crossSite.sites[].name is required" .name }}
-{{- if has $n $names }}{{ fail (printf "crossSite.sites: duplicate name %q" $n) }}{{ end }}
-{{- $names = append $names $n }}
-{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $n) }}{{ fail (printf "crossSite.sites[].name %q must be a DNS label" $n) }}{{ end }}
-{{- $addr := required (printf "crossSite.sites[%s].address is required" $n) .address }}
-{{- if regexMatch "^[0-9.]+$|:" $addr }}
-{{- fail (printf "crossSite.sites[%s].address %q must be a hostname, not an IP: mixed address types split the tier-0 cluster per site and retries can no longer move to another site" $n $addr) }}
-{{- end }}
-{{- if lt (int (.weight | default 0)) 1 }}{{ fail (printf "crossSite.sites[%s].weight must be >= 1 (its share of fleet capacity, e.g. node count)" $n) }}{{ end }}
-{{- end }}
-{{- if not (has $self $names) }}
-{{- fail (printf "crossSite.self %q is not in crossSite.sites %v" $self $names) }}
+{{- fail "crossSite needs healthRoute.enabled: the fleet's tier 0 health-checks every site on that path to decide where this model is served" }}
 {{- end }}
 {{- $perNode := int (required "crossSite.serving.requestsPerNode is required (recipe: in-flight requests one node absorbs before this site sheds)" $cs.serving.requestsPerNode) -}}
 {{- $replicas := int (required "crossSite.serving.gatewayReplicas is required (Envoy replicas of this site's gateway; circuit breakers count per replica)" $cs.serving.gatewayReplicas) -}}
 {{- $total := mul $perNode (len .Values.nodes) -}}
 self: {{ $self }}
 peerListener: {{ $peer }}
-hostname: {{ $hostname }}
 servingMaxParallel: {{ div (add $total (sub $replicas 1)) $replicas }}
 {{- end -}}

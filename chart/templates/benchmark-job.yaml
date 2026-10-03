@@ -12,9 +12,14 @@ Hugging Face; that also pins the pod to a serving node.
 {{- $bench := .Values.benchmark -}}
 {{- $image := include "kserve-llm.image" (dict "root" . "image" $bench.image "what" "benchmark.image") -}}
 {{- $url := required "benchmark.url is required (the site-local gateway URL, not the global name)" $bench.url -}}
+{{- with (.Values.globalName | default dict).fqdn }}
+{{- if contains . $url }}
+{{- fail (printf "benchmark.url %q uses the global name; it must be this site's own gateway" $url) }}
+{{- end }}
+{{- end }}
 {{- $headers := deepCopy $bench.headers -}}
 {{- if .Values.crossSite.enabled }}
-{{- /* Tier 0 would spread the run over every site; pin it to this one. */ -}}
+{{- /* The fleet's tier 0 would spread the run over every site; pin it to this one. */ -}}
 {{- $_ := set $headers .Values.crossSite.pinHeader (include "kserve-llm.crossSite" . | fromYaml).self -}}
 {{- end }}
 apiVersion: batch/v1

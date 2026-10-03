@@ -23,31 +23,63 @@ Sources read at these revisions:
 ## Status (2026-10-03, after review)
 
 **Decided:**
-- **Fleet scope.** GLM-5.3 **FP4 on B200 only**, on a subset of the original four sites (which ones
-  is still open). That makes the fleet homogeneous: one recipe everywhere, capacity weight = node
-  count. A11 (`max-model-len` differing per site) and the H200 two-node DP16 problem no longer
-  apply.
+- **Fleet scope: multi-model** (supersedes "GLM-5.3 FP4 on B200 only"). There are 4 sites serving
+  3 models unevenly: GLM-5.3 FP4 on 2 B200 sites, Kimi K2.7 on 3 H200 sites, Qwen3.8 27B on 2
+  sites. One endpoint for all of them. Membership and load must be dynamic, with no per-model site
+  lists.
+- **One hardware type per model.** Each model has one recipe. This replaces the old A11 scope fix:
+  health-check membership would pool a model across sites with different recipes.
 - **Track B first, Envoy-native, no custom picker.** The tier-0 picker (Step 4) is deferred.
-  A9 means cross-site prefix affinity buys little today. Load-only pooling is what delivers "use
-  all my hardware", and it needs no new image.
-- **Metering at the entry tier 0; rate limiter fails open** (Q4, Step 4b).
+  A9 means cross-site prefix affinity buys little today.
+- **Least-request across sites by default; consistent hashing per model ships off** (no session
+  header exists; never hash on the tenant).
+- **Metering at the entry tier 0; the rate limiter fails open** (Q4, Step 4b).
 - **Dynamo is the preferred Step 6** (Q8).
 
-**Built and merged to `main`:** the chart's `crossSite` mode (PR #2). The design deviates from Step 3
-below where Envoy Gateway's source showed a simpler mechanism:
-- **One merged cluster plus retries, not per-site priority fallback rules.** At v1.8.5, Envoy
-  Gateway turns a rule's `backendRefs` into **one** Envoy cluster with one locality per backend,
-  as long as every backend has the same address type and no per-backend filters
-  (`internal/ir/xds.go` `NeedsClusterPerSetting`). Retries use the `previous_hosts` predicate
-  (`internal/xds/translator/route.go:800-816`), so a retried request moves to a **different site**.
-  A per-site `x-target-site` rule with local-site priority fallback isn't needed without a picker.
-- **Shedding happens at the receiving site, not with a breaker at the sender.** Each site's serving
-  route has a circuit breaker at its own capacity and returns 503 past it. Envoy retries 503s
-  carrying `x-envoy-overloaded`; only `x-envoy-ratelimited` blocks a retry
-  (`source/common/router/retry_state_impl.cc:356-361`). So the sender's tier 0 moves the request
-  on. That gives A10's "overflow must be routed, not queued" without any load data.
-- **The local site is in `crossSite.sites` like the others** (D4); there is no separate `peers:`
-  list.
+**Built:**
+- **`fleet/` chart** (branch `fleet-router`): one identical tier-0 release per cluster, built from
+  the catalogue `values/fleet.yaml` (models, sites). It holds every model's route, metering and the
+  global name.
+- **The model chart's `crossSite`** only serves: its serving route sits on the peer listener with a
+  shed policy and a pinned benchmark.
+- **History:** this replaced the first `crossSite` (PR #2), which had per-model site lists and
+  static weights.
+
+**Source findings behind the build** (Envoy Gateway v1.8.5, Agent Router v1.1.0, Envoy `main`,
+vLLM v0.30.0):
+
+- **Weights and least-request exclude each other. This corrects the first `crossSite` design.**
+  - Envoy Gateway's default LB is least-request with locality weighting, and each `backendRef`
+    becomes its own locality (`internal/xds/translator/cluster.go` `buildLocalityLbConfig`,
+    `buildWeightedLocalities`). Envoy picks a locality by weight first.
+  - With one backend per site, least-request has a single host to choose from, so it does nothing.
+  - **All sites must be endpoints of one `Backend`** (one locality) for least-request or hashing to
+    compare sites. Endpoint weights are then fixed at 1, so capacity weights are gone.
+  - The `ConsistentHash` Maglev balancer ignores locality weights unless weighted zones are
+    configured.
+- **One cluster per route rule** (`internal/gatewayapi/helpers.go:497`). The shared all-sites
+  `Backend` gets an independent cluster, health check and limits per model route. That is what
+  makes per-model membership by health check work.
+- **Retries change site.** They use the `previous_hosts` predicate
+  (`internal/xds/translator/route.go:800-816`).
+- **503s are retried.** Envoy retries a 503 carrying `x-envoy-overloaded`; only
+  `x-envoy-ratelimited` blocks a retry (`source/common/router/retry_state_impl.cc:356-361`). So a
+  site's shed is retried elsewhere, which gives A10's "overflow must be routed, not queued" without
+  any load data.
+- **The shed breaker survives** Agent Router's InferencePool cluster rewrite. `handleInferencePoolCluster`
+  in `post_cluster_modify.go` changes the discovery type, load-balancer policy and config, connect
+  timeout and EDS, and leaves `circuit_breakers` untouched. Confirm once via `/clusters`.
+- **ORCA (`BackendUtilization`) is rejected as a load signal.** vLLM v0.30.0 adds
+  `endpoint-load-metrics` only on non-streaming responses (`chat_completion/api_router.py:72`), and
+  per pod, not per site.
+- **The shed limit counts requests, not work.** Size `requestsPerNode` from vLLM's
+  `Maximum concurrency for <N> tokens per request` at a realistic context. A slot-based figure
+  (512 + queue) almost never trips with ~200K-token agent requests.
+- **The stickiness cost is real.** With least-request, a repeat prefix lands on its warm site about
+  1/sites of the time. That is ≈ 1/32 on four sites against ≈ 1/8 when site-sticky, given A9's 1/8
+  inside a site. Turn on hashing once Track A fixes A9.
+- **Every stream crosses two gateways.** Restarting the entry gateway cuts streams served
+  elsewhere; drain timeouts don't cover hour-long streams.
 - **Load reporters (Step 2) not built.** Nothing consumes them until the picker exists.
 
 Full rationale: [`docs/cross-site-architecture.md`](docs/cross-site-architecture.md).
@@ -443,21 +475,23 @@ ranking.
 5. **Bandwidth.** Inter-site bandwidth and contention, not RTT. This decides A7.
 6. **Pinning.** Are there residency or failure-domain rules that pin any tenant or data to a site?
    Tier 0 would need a filter for them.
-7. ~~**Recipes.**~~ **Resolved by scope:** one FP4 B200 recipe on every site, so `max-model-len`
-   matches everywhere (A11), and the H200 multi-node deployment is out of scope.
+7. ~~**Recipes.**~~ **Resolved by rule:** one hardware type and one recipe per model. Recipes still
+   owed: GLM-5.3 FP4 B200, Kimi K2.7 H200, Qwen3.8 27B. Each must set
+   `crossSite.serving.requestsPerNode` from vLLM's concurrency log line.
 8. ~~**Dynamo.**~~ **Answered:** yes, Dynamo is preferred. Step 6 is now the relay, pending the
    event-stream shim question above. Still open: which Dynamo version runs elsewhere in the org
    (the relay is v1.4+ and experimental), and whether those images are already mirrored.
-9. **Node RAM** on the B200 nodes, and peak cgroup `anon`/`file` during a cold load (Track A3).
-10. **Which sites** take part, and their node counts (the `crossSite.sites` list, with weights).
-11. **The FP4 recipe** (`values/glm53-fp4-b200.yaml`), including
-    `crossSite.serving.requestsPerNode`.
-12. **CRD fields used by `crossSite`, checked against the cluster.** They were read from
-    Agent Router v1.1.0 and Envoy Gateway v1.8.5 source:
+9. **Node RAM** on each hardware type, and peak cgroup `anon`/`file` during a cold load (Track A3).
+10. ~~**Which sites / node counts.**~~ **Not needed:** membership comes from health checks and load
+    from least-request. `values/fleet.yaml` lists every site and every model.
+11. **CRD fields used by `fleet/` and `crossSite`, checked against the cluster.** They were read
+    from Agent Router v1.1.0 and Envoy Gateway v1.8.5 source:
     - `AIServiceBackend.spec.{schema,backendRef}`
-    - `AIGatewayRoute` `rules[].name` and `backendRefs[].weight`
-    - `Backend.spec.tls.{sni,caCertificateRefs,clientCertificateRef}`
-    - `BackendTrafficPolicy` `retry`, `healthCheck.{panicThreshold,active.http.hostname}` and
-      `circuitBreaker`
-13. **AMKO `GSLBHostRule` down-response field** (Step 5). Its exact name and values, before it is
-    added to the template.
+    - `AIGatewayRoute` `rules[].name`
+    - `Backend.spec.{endpoints[].fqdn,tls.{sni,caCertificateRefs,clientCertificateRef}}`
+    - `BackendTrafficPolicy` `loadBalancer.{type,consistentHash.header}`, `retry`,
+      `healthCheck.{panicThreshold,active.http.hostname}` and `circuitBreaker`
+    - `HTTPRouteFilter.spec.directResponse`
+12. **AMKO `GSLBHostRule` down-response field** (Step 5). Its exact name and values, before it is
+    added to `fleet/templates/globalname.yaml`.
+13. **A session header** for consistent hashing, once clients can send one.
