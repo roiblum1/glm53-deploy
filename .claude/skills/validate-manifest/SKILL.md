@@ -13,6 +13,14 @@ helm template check chart -n check -f <recipe> -f <site> \
   | python3 .claude/skills/validate-manifest/validate.py -
 ```
 
+The fleet chart (tier 0, one release per cluster) is validated the same way; the script detects a fleet render (no `LLMInferenceService`, tier-0 routes only):
+
+```bash
+helm lint fleet -f values/fleet.yaml -f <site>
+helm template fleet fleet -n <ns> -f values/fleet.yaml -f <site> \
+  | python3 .claude/skills/validate-manifest/validate.py -
+```
+
 Also render once with `--set serving.enabled=false` and confirm it contains no `LLMInferenceService` or `AIGatewayRoute` (stage 1 of the install).
 
 Report tersely:
@@ -30,6 +38,7 @@ Not covered by the script; review by reading when the relevant values changed:
 - `max-num-seqs` and `max-num-batched-tokens` are per DP rank, not per pod.
 - `resources.limits.memory` fits node RAM (page cache counts against it).
 - The KServe HTTPRoute and the AIGatewayRoute are not on the same Gateway listener.
-- With `crossSite`: `crossSite.sites` is identical in every `values/sites/*.yaml` (only `self` and `serving.gatewayReplicas` differ), weights match node counts, and `serving.gatewayReplicas` matches the gateway's Envoy replica count on that cluster.
+- With `crossSite`: `crossSite.self` is a name in `values/fleet.yaml` `sites`, `serving.gatewayReplicas` matches the gateway's (fixed) Envoy replica count on that cluster, and `requestsPerNode` comes from vLLM's "Maximum concurrency for <N> tokens per request" at a realistic context, not from slot counts.
+- Fleet: every model in `values/fleet.yaml` runs on one hardware type, and its name equals that model release's `model.name`.
 
 When a rule is added to the chart or its README, add the matching check to `validate.py`.
