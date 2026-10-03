@@ -30,5 +30,6 @@ Not covered by the script; review by reading when the relevant values changed:
 - `max-num-seqs` and `max-num-batched-tokens` are per DP rank, not per pod.
 - `resources.limits.memory` fits node RAM (page cache counts against it).
 - The KServe HTTPRoute and the AIGatewayRoute are not on the same Gateway listener.
+- With `crossSite`: `crossSite.sites` is identical in every `values/sites/*.yaml` (only `self` and `serving.gatewayReplicas` differ), weights match node counts, and `serving.gatewayReplicas` matches the gateway's Envoy replica count on that cluster.
 
 When a rule is added to the chart or its README, add the matching check to `validate.py`.

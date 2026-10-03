@@ -27,5 +27,16 @@ Route:
   oc get aigatewayroute {{ $fullname }} -n {{ $ns }} -o jsonpath='{.status.conditions}'
   curl -s $AGENT_ROUTER_URL/v1/chat/completions -H 'content-type: application/json' \
     -d '{"model":"{{ .Values.model.name }}","messages":[{"role":"user","content":"hi"}]}'
+{{- if .Values.crossSite.enabled }}
+
+Cross-site (tier 0 {{ $fullname }}-sites on listener {{ .Values.route.gateway.sectionName }}, serving route on {{ .Values.crossSite.peerListener }}):
+  oc get aigatewayroute {{ $fullname }}-sites -n {{ $ns }} -o jsonpath='{.status.conditions}'
+  oc get backend,aiservicebackend -n {{ $ns }} -l app.kubernetes.io/component=cross-site
+  # each site, pinned:
+{{- range .Values.crossSite.sites }}
+  curl -s $AGENT_ROUTER_URL/v1/chat/completions -H '{{ $.Values.crossSite.pinHeader }}: {{ .name }}' -H 'content-type: application/json' \
+    -d '{"model":"{{ $.Values.model.name }}","messages":[{"role":"user","content":"hi"}],"max_tokens":1}'
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}

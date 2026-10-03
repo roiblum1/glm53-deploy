@@ -5,15 +5,11 @@ release owns its own policy. A Gateway accepts only one BackendTrafficPolicy;
 per-model policies aimed at the shared Gateway would conflict.
 Cost is taken from the llmRequestCosts metadata, so it is charged after the
 response: the request that crosses the budget completes, the next one gets 429.
+With crossSite on, metering moves to the tier-0 route and this lives in the
+tier-0 policy in crosssite.yaml instead (one policy per route).
 */ -}}
-{{- if and .Values.serving.enabled .Values.route.enabled .Values.rateLimit.enabled }}
+{{- if and .Values.serving.enabled .Values.route.enabled .Values.rateLimit.enabled (not .Values.crossSite.enabled) }}
 {{- $fullname := include "kserve-llm.fullname" . -}}
-{{- $limit := .Values.rateLimit -}}
-{{- $costKeys := list -}}
-{{- range .Values.route.llmRequestCosts }}{{ $costKeys = append $costKeys .metadataKey }}{{ end -}}
-{{- if not (has $limit.costKey $costKeys) }}
-{{- fail (printf "rateLimit.costKey %q is not a metadataKey in route.llmRequestCosts" $limit.costKey) }}
-{{- end }}
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: BackendTrafficPolicy
 metadata:
@@ -30,30 +26,5 @@ spec:
     - group: gateway.networking.k8s.io
       kind: HTTPRoute
       name: {{ $fullname }}
-  rateLimit:
-    type: Global
-    global:
-      rules:
-        - clientSelectors:
-            - headers:
-                - name: {{ required "rateLimit.clientHeader is required" $limit.clientHeader }}
-                  type: Distinct
-                - name: x-ai-eg-model
-                  type: Exact
-                  value: {{ .Values.model.name }}
-          limit:
-            requests: {{ int64 $limit.tokens }}
-            unit: {{ $limit.unit }}
-          cost:
-            request:
-              from: Number
-              number: 0
-            response:
-              from: Metadata
-              metadata:
-                namespace: io.envoy.ai_gateway
-                key: {{ $limit.costKey }}
-        {{- with $limit.extraRules }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+  {{- include "kserve-llm.rateLimit" . | nindent 2 }}
 {{- end }}

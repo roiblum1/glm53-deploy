@@ -20,6 +20,7 @@ route:
   gateway:                           # the Agent Router Gateway
     name: ai-gateway
     namespace: ai-gateway
+    sectionName: https               # client listener; required with crossSite
 
 argocd:
   enabled: true
@@ -52,3 +53,20 @@ globalName:
     create: true                     # AMKO leader cluster only; false on the other sites
     healthMonitorRefs:
       - glm53-health                 # federated HTTPS monitor on Avi: GET /healthz/glm-5.3 -> 200
+    poolAlgorithmSettings:           # with crossSite, affinity is not DNS's job: spread entry
+      lbAlgorithm: GSLB_ALGORITHM_ROUND_ROBIN
+
+# Tier 0: this gateway spreads requests over every site below. Needs the peer
+# listener, its certificate and the client certificate (README "Multiple sites").
+crossSite:
+  enabled: true
+  self: site1
+  peerListener: peers                # mTLS listener on route.gateway for other sites
+  sites:                             # identical on every site; weight = node count
+    - {name: site1, address: llm.site1.example.internal, weight: 2}
+    - {name: site2, address: llm.site2.example.internal, weight: 2}
+  tls:
+    caCertificateRef: {kind: ConfigMap, name: llm-peer-ca}
+    clientCertificateSecret: llm-peer-client
+  serving:
+    gatewayReplicas: 2               # Envoy replicas of ai-gateway on this cluster

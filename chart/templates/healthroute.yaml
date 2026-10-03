@@ -3,6 +3,8 @@ Per-model health endpoint on the Agent Router gateway, for the GSLB monitor.
 It answers 200 only while this site has a ready replica of the model, so the
 GSLB pulls a site whose gateway is up but whose model is not. A monitor on the
 gateway alone (or on /v1/models, which the gateway answers itself) cannot see that.
+With crossSite on it is also attached to the peer listener: every site's tier 0
+health-checks this site on the same path.
 */ -}}
 {{- if and .Values.serving.enabled .Values.healthRoute.enabled }}
 {{- $fullname := include "kserve-llm.fullname" . -}}
@@ -26,6 +28,13 @@ spec:
       {{- with .Values.route.gateway.sectionName }}
       sectionName: {{ . }}
       {{- end }}
+    {{- if .Values.crossSite.enabled }}
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ .Values.route.gateway.name }}
+      namespace: {{ .Values.route.gateway.namespace }}
+      sectionName: {{ (include "kserve-llm.crossSite" . | fromYaml).peerListener }}
+    {{- end }}
   rules:
     - matches:
         - method: GET

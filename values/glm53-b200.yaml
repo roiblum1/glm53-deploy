@@ -78,3 +78,8 @@ serving:
 
   shmSize: 64Gi                      # preset is 1Gi; 8 ranks need more
   terminationGracePeriodSeconds: 300 # KServe derives --shutdown-timeout=280s
+
+crossSite:
+  serving:
+    # 8 DP ranks x max-num-seqs 64 = 512 running, plus ~25% queue.
+    requestsPerNode: 640

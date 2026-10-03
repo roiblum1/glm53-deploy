@@ -188,16 +188,37 @@ svc = llmisvcs[0] if llmisvcs else {}
 model_name = dig(svc, "spec", "model", "name")
 pool = f"{dig(svc, 'metadata', 'name')}-inference-pool"
 
+
+def section(route):
+    return {r.get("sectionName") for r in dig(route, "spec", "parentRefs", default=[])}
+
+
+def is_tier0(route):
+    refs = [b for rule in dig(route, "spec", "rules", default=[]) for b in rule.get("backendRefs", [])]
+    return bool(refs) and all(b.get("kind") in (None, "AIServiceBackend") for b in refs)
+
+
+tier0_routes = [r for r in of_kind("AIGatewayRoute") if is_tier0(r)]
+serving_routes = [r for r in of_kind("AIGatewayRoute") if not is_tier0(r)]
+ai_backends = {dig(b, "metadata", "name"): b for b in of_kind("AIServiceBackend")}
+backends = {dig(b, "metadata", "name"): b for b in of_kind("Backend")}
+
 for route in of_kind("AIGatewayRoute"):
+    tier0 = route in tier0_routes
     for i, rule in enumerate(dig(route, "spec", "rules", default=[])):
         where = f"{name(route)} rule {i}"
         models = [h.get("value") for m in rule.get("matches", []) for h in m.get("headers", [])
                   if h.get("name") == "x-ai-eg-model"]
         if model_name not in models:
             errors.append(f"{where}: x-ai-eg-model matches {models}, llmisvc model.name is {model_name!r}")
-        pools = [b.get("name") for b in rule.get("backendRefs", []) if b.get("kind") == "InferencePool"]
-        if pools != [pool]:
-            errors.append(f"{where}: InferencePool backendRefs {pools}, expected exactly [{pool!r}]")
+        if tier0:
+            for b in rule.get("backendRefs", []):
+                if b.get("name") not in ai_backends:
+                    errors.append(f"{where}: backendRef {b.get('name')!r} has no AIServiceBackend in the render")
+        else:
+            pools = [b.get("name") for b in rule.get("backendRefs", []) if b.get("kind") == "InferencePool"]
+            if pools != [pool]:
+                errors.append(f"{where}: InferencePool backendRefs {pools}, expected exactly [{pool!r}]")
         if not dig(rule, "timeouts", "request"):
             errors.append(f"{where}: no timeouts.request (default 60s kills long reasoning)")
     for ref in dig(route, "spec", "parentRefs", default=[]):
@@ -206,10 +227,52 @@ for route in of_kind("AIGatewayRoute"):
             notes.append(f"{name(route)}: cross-namespace parentRef to {ref_ns}/{ref.get('name')} — "
                          f"its listener allowedRoutes must admit {dig(route, 'metadata', 'namespace')}")
 
+# --- cross-site tier 0 ---------------------------------------------------------
+for t0 in tier0_routes:
+    if None in section(t0):
+        errors.append(f"{name(t0)}: no sectionName; the tier-0 route would also attach to the peer listener and loop")
+    for sr in serving_routes:
+        if section(t0) & section(sr):
+            errors.append(f"{name(t0)} and {name(sr)} share listener {sorted(section(t0) & section(sr))}: "
+                          "clients would reach the serving route unmetered, or peers would re-enter tier 0")
+        if dig(sr, "spec", "llmRequestCosts"):
+            errors.append(f"{name(sr)}: llmRequestCosts on the serving route as well as tier 0 — tokens are charged twice")
+    if not dig(t0, "spec", "llmRequestCosts"):
+        warns.append(f"{name(t0)}: no llmRequestCosts — nothing meters client traffic")
+tls_settings = set()
+for bname, b in backends.items():
+    for ep in dig(b, "spec", "endpoints", default=[]):
+        if "fqdn" not in ep:
+            errors.append(f"Backend/{bname}: endpoint is not fqdn — mixed address types split the tier-0 cluster per site, "
+                          "so a retry can no longer move to another site")
+    tls_settings.add(repr(dig(b, "spec", "tls")))
+    if not dig(b, "spec", "tls", "clientCertificateRef", "name"):
+        errors.append(f"Backend/{bname}: no tls.clientCertificateRef — the peer listener requires a client certificate")
+if len(tls_settings) > 1:
+    warns.append("Backends differ in tls settings — Envoy Gateway may build one cluster per site; check retries still cross sites")
+for asb_name, asb in ai_backends.items():
+    ref = dig(asb, "spec", "backendRef", "name")
+    if ref not in backends:
+        errors.append(f"AIServiceBackend/{asb_name}: backendRef {ref!r} has no Backend in the render")
+
 # --- rate limit ----------------------------------------------------------------
 route_names = {dig(r, "metadata", "name") for r in of_kind("AIGatewayRoute")}
 cost_keys = {c.get("metadataKey") for r in of_kind("AIGatewayRoute")
              for c in dig(r, "spec", "llmRequestCosts", default=[])}
+policy_targets = {}
+for btp in of_kind("BackendTrafficPolicy"):
+    for ref in dig(btp, "spec", "targetRefs", default=[]):
+        policy_targets.setdefault((ref.get("kind"), ref.get("name")), []).append(name(btp))
+for (kind, target), owners in policy_targets.items():
+    if len(owners) > 1:
+        errors.append(f"{kind}/{target} is targeted by several BackendTrafficPolicies {owners}; only one takes effect")
+tier0_names = {dig(r, "metadata", "name") for r in tier0_routes}
+for btp in of_kind("BackendTrafficPolicy"):
+    if any(ref.get("name") in tier0_names for ref in dig(btp, "spec", "targetRefs", default=[])):
+        if not dig(btp, "spec", "retry"):
+            errors.append(f"{name(btp)}: tier-0 policy without retry — a site shedding 503 fails the request instead of moving it")
+        if dig(btp, "spec", "healthCheck", "panicThreshold") != 0:
+            warns.append(f"{name(btp)}: healthCheck.panicThreshold is not 0 — with most sites down Envoy routes to dead ones")
 for btp in of_kind("BackendTrafficPolicy"):
     for ref in dig(btp, "spec", "targetRefs", default=[]):
         if ref.get("kind") == "Gateway":
@@ -235,6 +298,8 @@ for job in of_kind("Job"):
     args = [a for c in pod.get("containers", []) for a in c.get("args", [])]
     if not any(a.startswith("--tokenizer=/") for a in args):
         errors.append(f"{name(job)}: no local --tokenizer path (AIPerf would fetch it from Hugging Face)")
+    if tier0_routes and not any(a == "--header" for a in args):
+        errors.append(f"{name(job)}: tier 0 is on but the benchmark is not pinned to this site; it would measure the fleet")
     hooks = dig(job, "metadata", "annotations", default={})
     if "helm.sh/hook" not in hooks:
         errors.append(f"{name(job)}: not a hook; it would run before the model is deployed")
@@ -250,6 +315,14 @@ for rule in of_kind("GSLBHostRule"):
         warns.append(f"{name(rule)}: no healthMonitorRefs — the default L4 monitor cannot see a site whose model is down")
     elif not health_paths:
         warns.append(f"{name(rule)}: health monitors set but healthRoute is off, so there is no model health path to probe")
+serving_sections = set().union(*[section(r) for r in serving_routes]) if serving_routes else set()
+for hr in of_kind("HTTPRoute"):
+    if tier0_routes and not (section(hr) & serving_sections):
+        errors.append(f"{name(hr)}: not attached to the peer listener {sorted(serving_sections)}; tier 0 health checks would fail")
+    if tier0_routes:
+        for rule in of_kind("GSLBHostRule"):
+            if dig(rule, "spec", "poolAlgorithmSettings", "lbAlgorithm") == "GSLB_ALGORITHM_CONSISTENT_HASH":
+                warns.append(f"{name(rule)}: consistent hash with tier 0 on — entry concentrates on few sites; use round robin")
 for h in of_kind("HostRule"):
     if dig(h, "spec", "virtualhost", "fqdn") == dig(h, "spec", "virtualhost", "gslb", "fqdn"):
         errors.append(f"{name(h)}: local and global fqdn are the same")
