@@ -236,12 +236,37 @@ The API side is solved (A9 row). Only the KServe wiring is open. If KServe can't
 fallback is an EPP that injects `X-data-parallel-rank` and keeps one port. That is not a move to one
 rank per pod, which would break the chart's full-node pod and static `local` PV design.
 
+**Hard constraint: at most 8 DP ranks per pod.** `targetPorts` has `MaxItems=8`, and DP8 uses all 8,
+so there is no headroom. The cap is per pod, not per deployment. A two-node DP16 deployment (8 ranks
+per pod) fits as 16 endpoints, but a recipe with more than 8 local ranks per pod can't be expressed in
+this API at all. The chart enforces it at render time: it fails when per-rank ports are on and the
+local DP size is above 8. The check lands **with** the per-rank `targetPorts` template, not before.
+Under today's internal DP balancer a pod exposes one port and the cap doesn't apply, so a guard now
+would only reject renders that work. The README "Design decisions" entry goes in the same change.
+
 **A2. Turn on KV events and precise prefix scoring.** Use llm-d's current "sticky until saturated"
 scheduler config. KV events must be per rank: vLLM offsets the ZMQ port by rank (`offset_endpoint_port`).
 
-**A3. Turn on CPU KV offloading.** A 59 ms restore beats seconds of recompute (A7). llm-d's GLM
-reference sizes this as 1500Gi of memory and `/dev/shm` per pod for 8 ranks. Compare that with the
-chart's `limits.memory: 1536Gi` and `shmSize: 64Gi`; those don't fit together as-is.
+**A3. Turn on CPU KV offloading: size it from node RAM first.** A 59 ms restore beats seconds of
+recompute (A7). The sizing is a budget against node RAM, not a value to copy.
+- `/dev/shm` is tmpfs and is charged to the pod's memory cgroup. `shmSize: 1500Gi` under
+  `limits.memory: 1536Gi` leaves about 36Gi for everything else, and the pod won't start.
+- Pinned host memory doesn't escape that. It is anonymous memory, also charged to the cgroup, and
+  locked, so a tight node OOM-kills instead of reclaiming.
+- Page cache from the 756 GB weight load is also charged; the recipe already notes "page cache
+  counts here".
+- So the budget is: offload tier + process working set + peak transient page cache during a cold
+  load, all under `limits.memory`, all under node RAM minus system reserve.
+
+Inputs needed before choosing numbers:
+- Node RAM per hardware type.
+- Peak `anon` and `file` from `memory.stat` across one cold start:
+  `oc exec <pod> -- cat /sys/fs/cgroup/memory.stat`, sampled through the load.
+- Which offload backend the target vLLM version uses. Shared-memory mmap across rank processes
+  (llm-d's `offloading-cpu`) and per-process pinned buffers have different crash and accounting
+  behaviour.
+- **Whether the H200 sites already run an offload tier.** If they do, Track A adopts that
+  configuration rather than adding a second tier.
 
 **A4. Re-measure** the per-rank hit rate and K. This is the gate for turning on the prefix term in
 Track B.
@@ -271,17 +296,29 @@ before I template them.**
 prefix fingerprint**:
 - Hash the system prompt plus the first N KB of messages. That gives a full ranking of sites, not
   just a winner.
-- Use rank 1, the home site, unless it is over τ. Then use rank 2, the deterministic overflow home,
-  unless it is also over τ. A hot prefix stays on two sites, not four.
-- Only if both are over τ, pick among the sites under τ, weighted-random by absolute headroom.
-  That is the herd-safe last resort.
+- **Quantise headroom into bands** (for example 10% of capacity-normalised headroom). Continuous
+  headroom values never tie, so a plain tie-break would never fire and placement would scatter by
+  load.
+- **The candidate set is every site whose band is within τ bands of the best site's band.** Hard
+  saturation (a site over its calibrated limit) excludes a site outright.
+- **Inside the candidate set, take the highest rendezvous rank.** The home site wins when it is a
+  candidate. Otherwise the next-ranked candidate does, which is usually rank 2, the deterministic
+  overflow home. A hot prefix stays on two sites, not four.
+- Weighted-random by absolute headroom applies only when no ranked candidate is eligible, as the
+  herd-safe last resort.
 
-τ is the prefix-term switch. Before Track A lands, set τ low. Tier 0 is then effectively load-first,
-and the hash ranking only breaks ties and keeps placement deterministic, rather than stubbing
-affinity to a flat 1.0. That costs nothing, keeps whatever accidental hits exist today, and means
-"turning on the prefix term" later is a τ change, not a picker change. Raise τ once Track A's
-measured hit rate justifies it. Calibrate τ the way llm-d does it per (model, accelerator),
-normalised per site for H200/B200/B300.
+τ is the single knob, and it moves smoothly. At τ = 0 only the top band qualifies: load-first, with
+the hash deciding among sites that are loaded alike, which is the common case once headroom is
+banded. As τ grows, the home site is kept at progressively worse relative load: affinity up to
+saturation. Run with τ = 0 until Track A's measured hit rate justifies more. Turning on the prefix
+term is then a τ change, not a picker change.
+
+Two details:
+- **Band hysteresis.** A site whose headroom sits on a band edge flips bands between polls. That
+  moves its prefixes' placement back and forth, the same oscillation in a new place. Enter a band
+  at the edge and leave it only 2-3 points past the edge.
+- **Normalisation.** Bands are computed on headroom normalised per site (H200/B200/B300), so a band
+  means the same spare capacity everywhere.
 
 This needs no shared state. Every tier 0 agrees on the ranking without coordinating, which removes
 most of the herd. It is not llm-d's "approximate" routing-history scheme: placement is deterministic
@@ -290,12 +327,18 @@ and there is no index to go stale. Run the A1/A2 sandbox test first.
 **Step 4b: Fleet-wide token budgets.** Point all four Envoy Gateway rate-limit services at **one
 shared Valkey**. This is a much lighter cross-site dependency than the refuted KV index: one counter
 op per request at < 10 ms, keyed by tenant, with no pod identity. Three things to settle:
-- **Failure mode.** Envoy Gateway's global rate limit is fail-open unless `failClosed` is set
-  (`internal/xds/translator/ratelimit.go:152-153`). A Valkey outage therefore means no limits
-  fleet-wide, not an outage. That is probably the right default; state it in the README.
-- **Placement.** The Valkey has to live somewhere. Use a primary with cross-site replicas and
-  Sentinel (the Envoy rate-limit service supports Sentinel), so one site's loss doesn't stop
-  enforcement for longer than a failover.
+- **Failure mode (decided): fail open; never set `failClosed`.** Envoy Gateway's global rate limit
+  is fail-open by default (`internal/xds/translator/ratelimit.go:152-153`). A budget exists to stop
+  a runaway tenant. A Valkey outage that stopped all inference fleet-wide would be far worse than
+  budgets lapsing for a few minutes.
+  - The capacity backstop during a lapse is the picker's saturation exclusion plus per-peer breakers
+    shedding with 503. That is their right role (A10).
+  - **Alert loudly** on the Envoy rate-limit filter's `ratelimit.error` and
+    `ratelimit.failure_mode_allowed` counters, and on the rate-limit service's Redis errors. Check
+    the exact stat names on the cluster.
+  - Write the fail-open behaviour into the README "Token rate limiting" section.
+- **Placement.** With fail-open, the HA question carries little weight. One primary with replicas
+  is enough; Sentinel is optional.
 - **Scope.** The Redis URL is Envoy Gateway install config, not chart config. It is a cluster
   pre-req, documented in "Cluster pre-reqs".
 
@@ -305,14 +348,39 @@ op per request at < 10 ms, keyed by tenant, with no pod identity. Three things t
 This is a real candidate, not a deferral. It still comes after Track A, because a site-level "this
 prefix is here" signal is only worth acting on once tier 3 turns it into a hit.
 
-The first investigation is the integration seam. The relay runs on the Dynamo runtime and consumes
-Dynamo workers' KV events, but these sites serve through KServe/llm-d. So either:
-- (a) the relay can ingest plain vLLM ZMQ KV events from llm-d pods, which needs checking against
-  `lib/llm/src/kv_dc_relay/docs/architecture.md` and the gRPC contract; or
-- (b) a thin adapter publishes llm-d-kv-cache state through the relay's gRPC contract.
+**The question is whether a shim can produce the relay's projection from llm-d, without a Dynamo
+deployment.** Answered from the contract (`lib/llm/src/kv_dc_relay/wan/grpc/protocol/relay.proto`
+and `docs/grpc-contract.md`). The protocol itself is easy to emit:
+- `KvEventRelay` has five RPCs: a catalog snapshot, CKF snapshot plus deltas (CBI1 payload), load
+  windows, readiness, and relay info.
+- `serving_endpoint` is descriptive metadata only.
+- `dc_id` gives the site namespacing that A8 lacked.
 
-Tier 0 consumes the per-site Cuckoo-filter projections. A hit adds one more rank-1 candidate, ahead
-of the hash ranking.
+But the keys **cannot be derived from llm-d's block index**:
+- `KvQuerySemantics.hash_format` is a closed enum, `DYNAMO_STANDARD_V1` or `DYNAMO_EAGLE_V1`.
+  Consumers "must reject unknown formats" and "must not fall back to a known format".
+- Each format fixes the whole token → block-hash → rolling-sequence-hash pipeline
+  (`kv-router/src/protocols.rs`, with test vectors).
+- llm-d's index stores only its own request keys (chained FNV-64a over CBOR, own seed) mapped to
+  pods, plus engine → request key mappings. **It keeps no tokens**, so its keys can't be rehashed
+  into Dynamo's space.
+
+So the shim sits on the **event stream**, not the index. It is a second subscriber to each site's
+vLLM ZMQ KV events, which carry the token chunks in `BlockStored`. It computes `DYNAMO_STANDARD_V1`
+hashes with `kv_block_size` matching vLLM's block size, maintains one CKF per pool, and serves the
+gRPC contract. On the consumer side, tier 0 tokenizes the request and computes the same hashes.
+
+That is smaller than a Dynamo deployment but bigger than a translation shim. In effect it
+reimplements the relay's producer side. Two ways to make it smaller:
+- **Check whether Dynamo's own vLLM event publisher/relay producer can run standalone** against
+  ZMQ, since Dynamo already consumes vLLM's ZMQ events for its own workers. The next question is in
+  `docs/architecture.md` (producer invariants).
+- **Or use the wire format with a private hash format.** That breaks the contract's closed enum. It
+  is acceptable only if tier 0 is the sole consumer, and it gives up the reason for adopting
+  Dynamo's relay.
+
+Tier 0 consumes the per-site projections. A hit adds one more rank-1 candidate, ahead of the hash
+ranking.
 
 **Air-gap check:**
 - Everything above is mirrorable: Valkey, the llm-d EPP and tokenizer images, Dynamo relay images,
@@ -335,12 +403,20 @@ of the hash ranking.
    `oc get network.config cluster -o jsonpath='{.spec.clusterNetwork[*].cidr}'`. Identical CIDRs
    rule out any shared pod-keyed index.
 4. ~~**Metering.**~~ **Answered:** at the entry tier 0, with budgets in one shared Valkey (Step 4b).
-   Still open: where that Valkey lives, and whether fail-open is acceptable.
+   Fail-open decided. Still open: which site hosts the primary.
 5. **Bandwidth.** Inter-site bandwidth and contention, not RTT. This decides A7.
 6. **Pinning.** Are there residency or failure-domain rules that pin any tenant or data to a site?
    Tier 0 would need a filter for them.
 7. **Recipes.** Will the H200 and B300 recipes keep `max-model-len` at 262144? If not, the picker
    needs a per-site context filter (A11).
+   - **The H200 deployment as described isn't expressible in this chart.** DP16 across two nodes
+     needs a multi-node (LeaderWorkerSet) worker spec. The chart's design is one full-node pod per
+     node with "data and expert parallelism inside the node". Bringing H200 sites under this chart
+     is its own work item. Until then "same chart recipe at every site" isn't true, and tier 0 must
+     not assume identical semantics: compare `max-model-len`, tokenizer and revision through the
+     load reporter.
+   - What does the H200 deployment run today: chart, KV offload tier, DP load-balancer mode?
+9. **Node RAM** per hardware type, and peak cgroup `anon`/`file` during a cold load (Track A3).
 8. ~~**Dynamo.**~~ **Answered:** yes, Dynamo is preferred. Step 6 is now the relay, pending the
-   integration seam above. Still open: which Dynamo version runs elsewhere in the org (the relay is
+   event-stream shim question above. Still open: which Dynamo version runs elsewhere in the org (the relay is
    v1.4+ and experimental), and whether those images are already mirrored.
