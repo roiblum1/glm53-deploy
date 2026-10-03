@@ -1,0 +1,113 @@
+{{- /*
+AIPerf run after every install/upgrade (Helm) or sync (Argo CD PostSync). It
+fails the hook when the model does not come up or the failure ratio / goodput
+SLOs are missed, which is what stops a multi-site rollout at this site.
+The init container waits for the model itself: neither Helm nor a stock Argo CD
+knows when an LLMInferenceService is ready.
+The models volume is mounted for the tokenizer, so nothing is fetched from
+Hugging Face; that also pins the pod to a serving node.
+*/ -}}
+{{- if and .Values.serving.enabled .Values.benchmark.enabled }}
+{{- $fullname := include "kserve-llm.fullname" . -}}
+{{- $bench := .Values.benchmark -}}
+{{- $image := include "kserve-llm.image" (dict "root" . "image" $bench.image "what" "benchmark.image") -}}
+{{- $url := required "benchmark.url is required (the site-local gateway URL, not the global name)" $bench.url -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $fullname }}-aiperf
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kserve-llm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: benchmark
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation
+    {{- if .Values.argocd.enabled }}
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    {{- end }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ add $bench.readyTimeoutSeconds $bench.runTimeoutSeconds }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: {{ $fullname }}
+        app.kubernetes.io/component: benchmark
+    spec:
+      restartPolicy: Never
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: wait-ready
+          image: {{ $image }}
+          command: ["python3", "-c"]
+          args:
+            - |
+              {{- .Files.Get "files/wait_ready.py" | nindent 14 }}
+          env:
+            - {name: TARGET_URL, value: {{ $url | quote }}}
+            - {name: MODEL, value: {{ .Values.model.name | quote }}}
+            - {name: READY_TIMEOUT_SECONDS, value: {{ $bench.readyTimeoutSeconds | quote }}}
+            - {name: EXTRA_HEADERS, value: {{ toJson $bench.headers | quote }}}
+            {{- include "kserve-llm.benchmarkEnv" . | nindent 12 }}
+      containers:
+        - name: aiperf
+          image: {{ $image }}
+          command: ["aiperf", "profile"]
+          args:
+            - --model-names={{ .Values.model.name }}
+            - --url={{ $url }}
+            - --endpoint-type=chat
+            - --streaming
+            - --ui=none
+            - --tokenizer=/models/{{ .Values.model.subPath }}
+            - --artifact-dir=/artifacts
+            - --concurrency={{ $bench.concurrency }}
+            - --request-count={{ $bench.requestCount }}
+            - --warmup-request-count={{ $bench.warmupRequestCount }}
+            - --isl={{ $bench.inputTokens }}
+            - --osl={{ $bench.outputTokens }}
+            {{- with $bench.failedRequestThreshold }}
+            - --failed-request-threshold={{ . }}
+            {{- end }}
+            {{- with $bench.goodput }}
+            - --goodput
+            - {{ . | quote }}
+            {{- end }}
+            {{- range $name, $value := $bench.headers }}
+            - --header
+            - {{ printf "%s:%s" $name $value | quote }}
+            {{- end }}
+            {{- if $bench.apiKeySecret.name }}
+            - --api-key=$(API_KEY)
+            {{- end }}
+            {{- range $bench.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - {name: HF_HUB_OFFLINE, value: "1"}
+            - {name: TRANSFORMERS_OFFLINE, value: "1"}
+            {{- include "kserve-llm.benchmarkEnv" . | nindent 12 }}
+          {{- with $bench.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - {name: models, mountPath: /models, readOnly: true}
+            - {name: artifacts, mountPath: /artifacts}
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ $fullname }}-models
+            readOnly: true
+        - name: artifacts
+          emptyDir: {}
+{{- end }}

@@ -1,0 +1,68 @@
+{{- $fullname := include "kserve-llm.fullname" . -}}
+{{- $volumes := dict "models" .Values.storage.models -}}
+{{- if .Values.storage.cache.enabled -}}
+{{- $_ := set $volumes "cache" .Values.storage.cache -}}
+{{- end -}}
+{{- if .Values.storage.storageClass.create }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storage.storageClass.name }}
+  labels:
+    {{- include "kserve-llm.labels" . | nindent 4 }}
+  {{- with include "kserve-llm.annotations" (dict "root" . "wave" "storage" "keep" true) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+{{- end }}
+{{- range $name, $volume := $volumes }}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ $fullname }}-{{ $name }}
+  labels:
+    {{- include "kserve-llm.labels" $ | nindent 4 }}
+  {{- with include "kserve-llm.annotations" (dict "root" $ "wave" "storage" "keep" true) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  capacity:
+    storage: {{ $volume.size }}
+  volumeMode: Filesystem
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: {{ $.Values.storage.storageClass.name }}
+  local:
+    path: {{ $volume.hostPath }}
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: {{ toJson $.Values.nodes }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}-{{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "kserve-llm.labels" $ | nindent 4 }}
+  {{- with include "kserve-llm.annotations" (dict "root" $ "wave" "storage" "keep" true) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  storageClassName: {{ $.Values.storage.storageClass.name }}
+  volumeName: {{ $fullname }}-{{ $name }}
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ $volume.size }}
+{{- end }}

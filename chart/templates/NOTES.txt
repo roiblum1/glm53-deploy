@@ -1,0 +1,31 @@
+{{- $fullname := include "kserve-llm.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- if .Values.modelPull.enabled }}
+Model pull (one Job per node, must be Complete before serving starts):
+  oc get job -n {{ $ns }} -l app.kubernetes.io/part-of={{ $fullname }},app.kubernetes.io/component=model-pull
+  oc wait --for=condition=complete job -n {{ $ns }} -l app.kubernetes.io/part-of={{ $fullname }},app.kubernetes.io/component=model-pull --timeout=12h
+{{- end }}
+{{- if not .Values.serving.enabled }}
+
+Serving is disabled. Once every pull Job is Complete:
+  helm upgrade {{ .Release.Name }} <chart> -n {{ $ns }} --reuse-values --set serving.enabled=true
+{{- else }}
+
+Serving:
+  oc get llmisvc {{ $fullname }} -n {{ $ns }} -o wide        # Ready=True
+  oc get inferencepool -n {{ $ns }}                          # {{ $fullname }}-inference-pool
+
+Confirm the preset merge kept httpGet and applied the overrides:
+  oc get deploy -n {{ $ns }} -l app.kubernetes.io/name={{ $fullname }} \
+    -o jsonpath='{.items[0].spec.template.spec.containers[0].args}{"\n"}{.items[0].spec.template.spec.containers[0].startupProbe}{"\n"}{.items[0].spec.template.spec.containers[0].readinessProbe}{"\n"}'
+
+Tune --max-num-seqs / --max-model-len from:
+  oc logs -n {{ $ns }} deploy/<name> | grep -E "KV cache size|Maximum concurrency"
+{{- if .Values.route.enabled }}
+
+Route:
+  oc get aigatewayroute {{ $fullname }} -n {{ $ns }} -o jsonpath='{.status.conditions}'
+  curl -s $AGENT_ROUTER_URL/v1/chat/completions -H 'content-type: application/json' \
+    -d '{"model":"{{ .Values.model.name }}","messages":[{"role":"user","content":"hi"}]}'
+{{- end }}
+{{- end }}

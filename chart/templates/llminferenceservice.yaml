@@ -1,0 +1,107 @@
+{{- /*
+Merged on top of the well-known preset kserve-config-llm-template, which runs
+  vllm serve /mnt/models --served-model-name <model.name> ... --port 8000 ... "$@"
+No spec.parallelism / spec.worker: this is the single-node Deployment path, one
+full-node replica per entry in .Values.nodes. DP/EP are passed as vLLM args.
+pvc://<claim>/<subPath> is mounted read-only at /mnt/models and the controller
+drops the storage-initializer (no copy, no S3 access from the serving pod).
+*/ -}}
+{{- if .Values.serving.enabled }}
+{{- $fullname := include "kserve-llm.fullname" . -}}
+{{- $serving := .Values.serving -}}
+{{- $cache := .Values.storage.cache -}}
+{{- $env := dict -}}
+{{- if $serving.offline -}}
+{{- $env = dict "HF_HUB_OFFLINE" "1" "TRANSFORMERS_OFFLINE" "1" -}}
+{{- end -}}
+{{- $env = merge (deepCopy $serving.env) $env -}}
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kserve-llm.labels" . | nindent 4 }}
+  {{- with include "kserve-llm.annotations" (dict "root" . "wave" "serving") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  model:
+    uri: pvc://{{ $fullname }}-models/{{ .Values.model.subPath }}
+    name: {{ .Values.model.name }}
+  replicas: {{ len .Values.nodes }}
+  {{- with $serving.rolloutStrategy }}
+  rolloutStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  router:
+    {{- if $serving.router.gatewayRefs }}
+    gateway:
+      refs:
+        {{- toYaml $serving.router.gatewayRefs | nindent 8 }}
+    {{- else }}
+    gateway: {}
+    {{- end }}
+    route: {}
+    scheduler: {}
+  template:
+    terminationGracePeriodSeconds: {{ $serving.terminationGracePeriodSeconds }}
+    {{- with .Values.tolerations }}
+    tolerations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.global.imagePullSecrets }}
+    imagePullSecrets:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    containers:
+      - name: main
+        image: {{ include "kserve-llm.image" (dict "root" . "image" $serving.image "what" "serving.image") }}
+        {{- with include "kserve-llm.servingArgs" . }}
+        args:
+          {{- . | nindent 10 }}
+        {{- end }}
+        {{- if $env }}
+        env:
+          {{- range $name, $value := $env }}
+          - name: {{ $name }}
+            value: {{ $value | quote }}
+          {{- end }}
+        {{- end }}
+        {{- with $serving.resources }}
+        resources:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with $serving.probes.startup }}
+        startupProbe:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with $serving.probes.liveness }}
+        livenessProbe:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with $serving.probes.readiness }}
+        readinessProbe:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- if $cache.enabled }}
+        volumeMounts:
+          - name: compile-cache
+            mountPath: {{ $cache.mountPath }}
+        {{- end }}
+    {{- if or $serving.shmSize $cache.enabled }}
+    volumes:
+      {{- if $serving.shmSize }}
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: {{ $serving.shmSize }}
+      {{- end }}
+      {{- if $cache.enabled }}
+      - name: compile-cache
+        persistentVolumeClaim:
+          claimName: {{ $fullname }}-cache
+      {{- end }}
+    {{- end }}
+{{- end }}

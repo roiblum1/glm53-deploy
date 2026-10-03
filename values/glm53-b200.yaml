@@ -1,0 +1,80 @@
+# GLM-5.3 (FP8) on HGX B200 nodes (8 GPUs each), no RoCE.
+# One pod per node, each pod the full node: DP8 x EP8 over NVLink. Nothing
+# crosses the node boundary except client traffic; the llm-d EPP picks the node
+# per request (prefix-cache aware) and vLLM balances across the 8 local ranks.
+#
+# Serving image needs vLLM >= 0.28 and transformers >= 5.15 (GlmMoeDsa arch).
+
+model:
+  name: glm-5.3
+  subPath: GLM-5.3
+
+storage:
+  models:
+    size: 1Ti          # weights are ~756 GB
+  cache:
+    size: 200Gi
+
+serving:
+  image:
+    repository: llm-d-cuda
+    tag: v0.9.0-vllm0.30.0
+
+  args:
+    # --- parallelism: DP8 x EP8 inside the node (MLA KV not replicated) ---
+    data-parallel-size: "8"
+    enable-expert-parallel: true
+    # vLLM 0.30 default, kept explicit. A/B candidates on NVLink:
+    # flashinfer_nvlink_one_sided, deepep_high_throughput
+    all2all-backend: allgather_reducescatter
+    # --- memory / KV ---
+    kv-cache-dtype: fp8_e4m3
+    gpu-memory-utilization: "0.90"
+    # one sequence must fit in ONE rank's KV pool; full 1M ctx = TP8 recipe
+    max-model-len: "262144"
+    max-num-seqs: "64"               # PER DP RANK -> 512 per node
+    max-num-batched-tokens: "8192"   # per rank
+    enable-prefix-caching: true
+    # --- GLM-5.3 recipe ---
+    # If engine init dies inside the MTP drafter under DP, set these two to
+    # null first (MTP+DP broke on GLM-5.2 / vLLM 0.24 before).
+    speculative-config.method: mtp
+    speculative-config.num_speculative_tokens: "5"
+    # glm47 is the parser name vLLM uses for GLM-5.x; not a typo.
+    reasoning-parser: glm47
+    tool-call-parser: glm47
+    enable-auto-tool-choice: true
+
+  env:
+    # DP engines wait for load + DeepGEMM warmup + graph capture
+    VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+    # persistent JIT caches, under storage.cache.mountPath
+    VLLM_CACHE_ROOT: /cache/vllm
+    DG_JIT_CACHE_DIR: /cache/deep_gemm
+    TRITON_CACHE_DIR: /cache/triton
+    FLASHINFER_WORKSPACE_BASE: /cache/flashinfer
+
+  resources:
+    requests:
+      cpu: "64"
+      memory: 512Gi
+      nvidia.com/gpu: "8"
+    limits:
+      memory: 1536Gi                 # size to node RAM; page cache counts here
+      nvidia.com/gpu: "8"
+
+  probes:
+    # Preset is 60 x 10s = 10 min: too short for a cold first boot (756 GB load
+    # + DeepGEMM JIT + torch.compile + MTP graph capture).
+    startup:
+      failureThreshold: 180          # 30 min
+    liveness:
+      timeoutSeconds: 5              # preset is 1s
+    # Preset is 1s timeout / 2 failures: the pod flaps out of the InferencePool
+    # when /health is slow under load.
+    readiness:
+      timeoutSeconds: 5
+      failureThreshold: 5
+
+  shmSize: 64Gi                      # preset is 1Gi; 8 ranks need more
+  terminationGracePeriodSeconds: 300 # KServe derives --shutdown-timeout=280s

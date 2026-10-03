@@ -1,0 +1,13 @@
+apiVersion: v2
+name: kserve-llm
+description: >-
+  Full-node vLLM replicas served by a KServe LLMInferenceService and exposed
+  through an Envoy AI Gateway (Agent Router) AIGatewayRoute, for air-gapped
+  clusters with node-local model storage.
+type: application
+version: 0.1.0
+keywords:
+  - kserve
+  - llminferenceservice
+  - envoy-ai-gateway
+  - vllm

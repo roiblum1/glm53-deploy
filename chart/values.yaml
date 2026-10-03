@@ -1,0 +1,253 @@
+# Generic defaults. A deployment is this file plus two overlays:
+#   values/<model>-<hardware>.yaml   the model recipe (args, env, resources, probes)
+#   values/site.yaml                 what differs per cluster (registry, nodes, S3, gateway)
+
+# Defaults to the release name. It names the LLMInferenceService, so the
+# InferencePool becomes <fullname>-inference-pool.
+fullnameOverride: ""
+
+global:
+  # Prefixed to every image repository. Air-gapped: the internal registry.
+  imageRegistry: ""
+  imagePullSecrets: []
+
+model:
+  # What clients send as "model"; also the x-ai-eg-model value the route matches.
+  name: ""
+  # Directory under the models volume. model.uri = pvc://<fullname>-models/<subPath>
+  subPath: ""
+
+# Hostnames of the serving nodes. Each node gets one full-node replica, one pull
+# Job and its own copy of the weights, so replicas = len(nodes).
+nodes: []
+
+# Applied to the serving pods and the pull Jobs (both must land on the GPU nodes).
+tolerations: []
+
+storage:
+  # Adds helm.sh/resource-policy: keep to the StorageClass, PVs and PVCs so
+  # `helm uninstall` does not release ~1 TB of synced weights.
+  keepOnUninstall: true
+  storageClass:
+    # Cluster-scoped. Set create: false if another release already owns it.
+    create: true
+    name: local-static
+  # Static `local` PVs whose nodeAffinity lists every node: each replica mounts
+  # its own node's copy at the same path. A dynamically provisioned (LVMO /
+  # TopoLVM) PVC is one LV pinned to one node, so replica #2 would stay Pending.
+  models:
+    size: 1Ti
+    hostPath: /var/mnt/llm/models
+  # JIT / compile caches, so restarts skip recompilation.
+  cache:
+    enabled: true
+    size: 200Gi
+    hostPath: /var/mnt/llm/cache
+    mountPath: /cache
+
+modelPull:
+  enabled: true
+  image:
+    repository: tools/s3cmd
+    tag: ""
+  # s3://bucket/path/ synced into <models volume>/<model.subPath>/
+  source: ""
+  # Secret with key `s3cfg`, mounted at /etc/s3cmd. Not created by this chart.
+  existingSecret: s3cmd-config
+  # Extra s3cmd flags, placed before the source.
+  extraArgs: []
+  backoffLimit: 3
+  resources:
+    requests:
+      cpu: "4"
+      memory: 8Gi
+
+serving:
+  # false = storage and pull Jobs only. Install with false, wait for the Jobs,
+  # then upgrade with true; otherwise vLLM starts on a half-synced model.
+  enabled: true
+  image:
+    repository: llm-d-cuda
+    tag: ""
+  # Sets HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1.
+  offline: true
+
+  # vLLM flags as flag: value, rendered as --flag=value. `true` renders a bare
+  # --flag, `null` drops a flag set by another values file. Quote numbers.
+  # The kserve-config-llm-template preset launches through `bash -c ... eval`
+  # and already passes the model path, --served-model-name and --port, so the
+  # chart refuses model / port / served-model-name and any value containing
+  # whitespace, quotes, braces or brackets. Use dotted keys instead of JSON.
+  args: {}
+  # Raw extra args, same single-token rule.
+  extraArgs: []
+
+  # NAME: value
+  env: {}
+
+  resources: {}
+
+  # Overrides merged onto the preset probes (preset: startup 60 x 10s, 1s timeouts).
+  probes:
+    startup: {}
+    liveness: {}
+    readiness: {}
+
+  # /dev/shm emptyDir (preset is 1Gi). Empty = keep the preset.
+  shmSize: ""
+
+  # KServe derives vLLM --shutdown-timeout from this.
+  terminationGracePeriodSeconds: 300
+
+  # The KServe default (25%/25%) gives maxSurge 1. A surge pod needs a full
+  # node of free GPUs that does not exist, so the rollout deadlocks.
+  rolloutStrategy:
+    maxSurge: 0
+    maxUnavailable: 1
+
+  router:
+    # Empty = KServe's default Gateway (inferenceservice-config
+    # ingress.kserveIngressGateway). If that Gateway does not exist, give the
+    # AI gateway a second listener and reference it here, e.g.
+    #   - {name: ai-gateway, namespace: ai-gateway, sectionName: kserve}
+    # and set route.gateway.sectionName to the other listener. Never put the
+    # KServe HTTPRoute and the AIGatewayRoute on the same listener: the
+    # path-specific HTTPRoute can win the match and bypass token metering.
+    gatewayRefs: []
+
+route:
+  # AIGatewayRoute -> the KServe InferencePool. Rendered only with serving.enabled.
+  enabled: true
+  gateway:
+    name: ai-gateway
+    namespace: ai-gateway
+    # Its listener's allowedRoutes must admit the release namespace.
+    sectionName: ""
+  # The Envoy default is 60s, which kills long reasoning.
+  requestTimeout: 3600s
+  llmRequestCosts:
+    - {metadataKey: llm_input_token, type: InputToken}
+    - {metadataKey: llm_output_token, type: OutputToken}
+    - {metadataKey: llm_reasoning_token, type: ReasoningToken}
+    - {metadataKey: llm_total_token, type: TotalToken}
+
+rateLimit:
+  # Per-client token budget for this model, enforced by Envoy Gateway's global
+  # rate limit. Needs the Envoy Gateway rate limit service with a Redis backend
+  # on the cluster. Budgets are counted per cluster: with N sites behind one
+  # name, a client can spend up to N x this budget.
+  enabled: false
+  # Header that identifies the client. It must be written by the gateway from
+  # the verified credential (JWT claim / API key) and stripped from client
+  # input, or anyone can pick another tenant's budget.
+  clientHeader: x-tenant-id
+  tokens: 2000000
+  unit: Hour                 # Second | Minute | Hour | Day
+  # Which llmRequestCosts key is charged. Total tokens by default.
+  costKey: llm_total_token
+  # Extra raw BackendTrafficPolicy rules. Every matching rule applies, so a
+  # larger budget for one tenant needs the default rule not to match it.
+  extraRules: []
+
+healthRoute:
+  # GET <path> on the Agent Router gateway -> the model's own health endpoint,
+  # for a GSLB monitor. Returns 200 only while a replica is ready on this site.
+  enabled: false
+  path: ""                   # default /healthz/<model.name>
+  backendPath: /health
+  # Default: the release's InferencePool. Set a Service backendRef here if the
+  # endpoint picker does not pass body-less requests through.
+  backendRef: {}
+
+benchmark:
+  # AIPerf Job, run as a Helm post-install/post-upgrade hook and an Argo CD
+  # PostSync hook. Keep it short: it runs on every sync, against production.
+  enabled: false
+  image:
+    repository: aiperf
+    tag: ""
+  # The site-local gateway URL. Never the global (GSLB) name, which would
+  # measure whichever site DNS happens to return.
+  url: ""
+  apiKeySecret:
+    name: ""
+    key: api-key
+  # Sent on every request, e.g. the tenant header when the gateway does not
+  # derive it from the API key.
+  headers: {}
+  # Extra env for both containers, e.g. SSL_CERT_FILE for an internal CA.
+  env: {}
+  # How long to wait for the model to answer before giving up (cold start).
+  readyTimeoutSeconds: 2700
+  runTimeoutSeconds: 1800
+  concurrency: 8
+  requestCount: 64
+  warmupRequestCount: 8
+  inputTokens: 1024
+  outputTokens: 256
+  # Fail the hook when more than this share of requests fail. Empty = off.
+  failedRequestThreshold: "0.05"
+  # AIPerf SLOs as "metric:value ...", e.g. "time_to_first_token:3000".
+  goodput: ""
+  extraArgs: []
+  resources: {}
+
+argocd:
+  # Adds sync-wave annotations, the PostSync hook on the benchmark Job, and
+  # Delete=false,Prune=false on storage. Argo CD waits for each wave to be
+  # healthy, so the pull Jobs finish before serving starts and the two-step
+  # install is not needed.
+  enabled: false
+  syncWaves:
+    storage: -3
+    pull: -2
+    serving: 0
+    # The rate limit is created before the route so the model is never
+    # reachable unmetered.
+    policy: 1
+    route: 2
+
+globalName:
+  # One name in front of every site (AKO + AMKO). These objects describe the
+  # gateway, not the model: if several releases share a gateway on a cluster,
+  # enable this in only one of them.
+  enabled: false
+  # The same on every site, e.g. llm.example.internal
+  fqdn: ""
+
+  hostRule:
+    # AKO HostRule mapping this cluster's gateway FQDN to the global FQDN.
+    # Needed on every cluster when AMKO runs in custom global FQDN mode
+    # (GSLBConfig useCustomGlobalFqdn: true). In default mode AMKO groups
+    # Services by identical hostname instead; set create: false.
+    create: true
+    apiVersion: ako.vmware.com/v1beta1
+    # Namespace of the gateway's LoadBalancer Service on this cluster.
+    namespace: ""
+    # The FQDN AKO assigned to that Service on this cluster.
+    localFqdn: ""
+
+  gslbHostRule:
+    # Create on the AMKO leader cluster only; AMKO pushes the GslbService to
+    # the Avi GSLB sites itself.
+    create: false
+    apiVersion: amko.vmware.com/v1alpha1
+    namespace: avi-system
+    # Clients re-resolve this often. Open connections are not affected, so a
+    # low TTL only speeds up failover.
+    ttl: 30
+    # Federated HTTPS monitors that already exist on the Avi controller. Use
+    # one that requests healthRoute's path and expects 200; the default L4
+    # monitor only proves the gateway port is open.
+    healthMonitorRefs: []
+    # Consistent hash keeps a client on one site, so its conversations keep
+    # hitting a warm prefix cache. The hash is on the DNS resolver's address
+    # unless resolvers send EDNS client subnet: with only a few resolvers it
+    # can put most traffic on a few sites. Then use GSLB_ALGORITHM_ROUND_ROBIN
+    # (even load, cold cache whenever a client moves) or GSLB_ALGORITHM_TOPOLOGY.
+    poolAlgorithmSettings:
+      lbAlgorithm: GSLB_ALGORITHM_CONSISTENT_HASH
+      hashMask: 24
+    # Optional per-cluster {cluster, weight (1-20), priority}. Weight sites by
+    # their node count when they differ in size.
+    trafficSplit: []

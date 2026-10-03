@@ -1,0 +1,297 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "model",
+    "nodes",
+    "storage",
+    "modelPull",
+    "serving",
+    "route"
+  ],
+  "properties": {
+    "model": {
+      "type": "object",
+      "required": [
+        "name",
+        "subPath"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "subPath": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^/].*[^/]$|^[^/]$"
+        }
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "tolerations": {
+      "type": "array"
+    },
+    "storage": {
+      "type": "object",
+      "properties": {
+        "keepOnUninstall": {
+          "type": "boolean"
+        },
+        "storageClass": {
+          "type": "object",
+          "required": [
+            "name"
+          ],
+          "properties": {
+            "create": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "models": {
+          "$ref": "#/definitions/localVolume"
+        },
+        "cache": {
+          "$ref": "#/definitions/localVolume"
+        }
+      }
+    },
+    "modelPull": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "$ref": "#/definitions/image"
+        },
+        "source": {
+          "type": "string",
+          "pattern": "^(s3://.+)?$"
+        },
+        "existingSecret": {
+          "type": "string",
+          "minLength": 1
+        },
+        "extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "backoffLimit": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "serving": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "$ref": "#/definitions/image"
+        },
+        "offline": {
+          "type": "boolean"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "shmSize": {
+          "type": "string"
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "router": {
+          "type": "object",
+          "properties": {
+            "gatewayRefs": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "namespace"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "gateway": {
+          "type": "object",
+          "required": [
+            "name",
+            "namespace"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "namespace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sectionName": {
+              "type": "string"
+            }
+          }
+        },
+        "requestTimeout": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "globalName": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "fqdn": {
+          "type": "string"
+        },
+        "hostRule": {
+          "type": "object",
+          "properties": {
+            "create": {
+              "type": "boolean"
+            },
+            "apiVersion": {
+              "type": "string",
+              "minLength": 1
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "localFqdn": {
+              "type": "string"
+            }
+          }
+        },
+        "gslbHostRule": {
+          "type": "object",
+          "properties": {
+            "create": {
+              "type": "boolean"
+            },
+            "apiVersion": {
+              "type": "string",
+              "minLength": 1
+            },
+            "namespace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "ttl": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "healthMonitorRefs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "poolAlgorithmSettings": {
+              "type": "object",
+              "properties": {
+                "lbAlgorithm": {
+                  "enum": [
+                    "GSLB_ALGORITHM_CONSISTENT_HASH",
+                    "GSLB_ALGORITHM_GEO",
+                    "GSLB_ALGORITHM_ROUND_ROBIN",
+                    "GSLB_ALGORITHM_TOPOLOGY"
+                  ]
+                }
+              }
+            },
+            "trafficSplit": {
+              "type": "array"
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "image": {
+      "type": "object",
+      "required": [
+        "repository"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string"
+        }
+      }
+    },
+    "localVolume": {
+      "type": "object",
+      "required": [
+        "size",
+        "hostPath"
+      ],
+      "properties": {
+        "size": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hostPath": {
+          "type": "string",
+          "pattern": "^/"
+        }
+      }
+    }
+  }
+}

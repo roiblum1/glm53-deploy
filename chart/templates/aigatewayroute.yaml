@@ -1,0 +1,44 @@
+{{- /*
+Agent Router AIGatewayRoute -> the InferencePool KServe creates for the
+LLMInferenceService. Only one InferencePool per rule, and it cannot be mixed
+with an AIServiceBackend in the same rule.
+*/ -}}
+{{- if and .Values.serving.enabled .Values.route.enabled }}
+{{- $fullname := include "kserve-llm.fullname" . -}}
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIGatewayRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kserve-llm.labels" . | nindent 4 }}
+  {{- with include "kserve-llm.annotations" (dict "root" . "wave" "route") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ .Values.route.gateway.name }}
+      namespace: {{ .Values.route.gateway.namespace }}
+      {{- with .Values.route.gateway.sectionName }}
+      sectionName: {{ . }}
+      {{- end }}
+  rules:
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: {{ .Values.model.name }}
+      backendRefs:
+        - group: inference.networking.k8s.io
+          kind: InferencePool
+          name: {{ $fullname }}-inference-pool
+      timeouts:
+        request: {{ .Values.route.requestTimeout }}
+  {{- with .Values.route.llmRequestCosts }}
+  llmRequestCosts:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

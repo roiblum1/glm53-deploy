@@ -1,0 +1,75 @@
+{{- /*
+One pull Job per node, each writing into that node's copy of the models PV.
+They run in the release namespace so the SELinux MCS label matches the serving
+pods. --no-preserve: do not restore the uid/gid/mode stored in S3.
+Job specs are immutable, so the name carries a hash of the spec: a changed
+spec becomes a new Job and Helm removes the old one.
+*/ -}}
+{{- if .Values.modelPull.enabled }}
+{{- $fullname := include "kserve-llm.fullname" . -}}
+{{- $pull := .Values.modelPull -}}
+{{- $source := required "modelPull.source is required (s3://bucket/path/)" $pull.source -}}
+{{- $image := include "kserve-llm.image" (dict "root" . "image" $pull.image "what" "modelPull.image") -}}
+{{- range $node := .Values.nodes }}
+{{- $hash := printf "%s|%s|%s|%s|%s" $node $image $.Values.model.subPath (toJson $pull) (toJson $.Values.tolerations) | sha256sum | trunc 8 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-pull-%s" $fullname $node | trunc 54 | trimSuffix "-" }}-{{ $hash }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "kserve-llm.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: model-pull
+  {{- with include "kserve-llm.annotations" (dict "root" $ "wave" "pull") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  backoffLimit: {{ $pull.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: {{ $fullname }}
+        app.kubernetes.io/component: model-pull
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        kubernetes.io/hostname: {{ $node }}
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: pull
+          image: {{ $image }}
+          command:
+            - s3cmd
+            - --config=/etc/s3cmd/s3cfg
+            - sync
+            - --no-preserve
+            {{- range $pull.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+            - {{ printf "%s/" (trimSuffix "/" $source) | quote }}
+            - /models/{{ $.Values.model.subPath }}/
+          {{- with $pull.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: s3cfg, mountPath: /etc/s3cmd, readOnly: true}
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ $fullname }}-models
+        - name: s3cfg
+          secret:
+            secretName: {{ $pull.existingSecret }}
+{{- end }}
+{{- end }}

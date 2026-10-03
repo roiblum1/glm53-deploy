@@ -1,0 +1,356 @@
+# =============================================================================
+# GLM-5.3 (FP8) on 2x HGX B200, no RoCE — KServe v0.21.0 LLMInferenceService
+# + Agent Router (ex Envoy AI Gateway) 1.1 AIGatewayRoute
+#
+# Topology: ONE LLMInferenceService, replicas: 2 -> one pod per node,
+# each pod = full node, DP8 x EP8 intra-node over NVLink. Nothing crosses the
+# node boundary except client traffic. The llm-d EPP (InferencePool) picks the
+# node per request (prefix-cache aware); vLLM balances across the 8 local ranks.
+#
+# Placeholders to replace: llm-glm53 (namespace), b200-01 / b200-02 (node
+# hostnames), REGISTRY/... (images), ai-gateway (Agent Router Gateway name/ns),
+# s3://models/zai-org/GLM-5.3/ (bucket path), s3cmd-config (secret with s3cfg).
+#
+# ---------------------------------------------------------------------------
+# PRE-REQS (verify once)
+#  1. Envoy Gateway >= v1.8.1 installed WITH the Agent Router InferencePool addon:
+#       config.envoyGateway.extensionManager.backendResources:
+#         - {group: inference.networking.k8s.io, kind: InferencePool, version: v1}
+#  2. Gateway API Inference Extension CRDs (InferencePool v1) + LWS installed.
+#  3. Serving image: vLLM >= 0.28 AND transformers >= 5.15 (GlmMoeDsa arch).
+#       oc run -it --rm chk --image=REGISTRY/llm-d-cuda:v0.9.0-vllm0.30.0 -- \
+#         python -c "import vllm,transformers;print(vllm.__version__,transformers.__version__)"
+#  4. /var/mnt/llm on BOTH nodes must sit on a data NVMe (>= 1 TB free), NOT the
+#     RHCOS root disk. E.g. exclude one NVMe from the LVMCluster deviceSelector,
+#     mkfs.xfs it and mount it at /var/mnt/llm with a MachineConfig mount unit.
+#     Then:
+#       for n in b200-01 b200-02; do
+#         oc debug node/$n -- chroot /host bash -c \
+#           'mkdir -p /var/mnt/llm/models /var/mnt/llm/cache &&
+#            chmod 1777 /var/mnt/llm/models /var/mnt/llm/cache &&
+#            chcon -R -t container_file_t /var/mnt/llm'
+#       done
+#  5. KServe's default Gateway must exist and be an Envoy Gateway Gateway:
+#       oc get gateway -n kserve kserve-ingress-gateway
+#     (router.gateway: {} resolves to inferenceservice-config
+#     ingress.kserveIngressGateway; the llmisvc only turns Ready once its
+#     InferencePool is accepted by THAT gateway). If it doesn't exist, use the
+#     gateway.refs fallback shown in the router section below.
+#  6. Keep ingress.enableLLMInferenceServiceTLS unset/false (the default). If
+#     true, vLLM and the EPP serve TLS and Agent Router needs a BackendTLSPolicy.
+#
+# WHY NOT THE LVMO PVC: an LVMO (TopoLVM) PVC is a single LV pinned to ONE node.
+# model.uri pvc://<claim> names one claim for all replicas, so replica #2 would
+# stay Pending (volume node affinity conflict). A static `local` PV whose
+# nodeAffinity lists both nodes gives every pod its own node's copy at the same
+# path — the same pattern KServe's LocalModelNodeGroup uses.
+# =============================================================================
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-static
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+# Model weights: same path on both nodes, each node holds its own copy.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: glm53-models
+spec:
+  capacity:
+    storage: 1Ti
+  volumeMode: Filesystem
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-static
+  local:
+    path: /var/mnt/llm/models
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: ["b200-01", "b200-02"]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: glm53-models
+  namespace: llm-glm53
+spec:
+  storageClassName: local-static
+  volumeName: glm53-models
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Ti
+---
+# Persistent JIT/compile caches (torch.compile, DeepGEMM, FlashInfer, Triton)
+# so restarts skip recompilation. Per-node, same path.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: glm53-cache
+spec:
+  capacity:
+    storage: 200Gi
+  volumeMode: Filesystem
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-static
+  local:
+    path: /var/mnt/llm/cache
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: ["b200-01", "b200-02"]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: glm53-cache
+  namespace: llm-glm53
+spec:
+  storageClassName: local-static
+  volumeName: glm53-cache
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 200Gi
+---
+# =============================================================================
+# Model pull — one Job per node (writes into that node's copy of the PV).
+# Run in the SAME namespace as the LLMInferenceService so the SELinux MCS
+# label matches. --no-preserve: don't restore S3-stored uid/gid/mode.
+# =============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: glm53-pull-b200-01
+  namespace: llm-glm53
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        kubernetes.io/hostname: b200-01
+      containers:
+        - name: pull
+          image: REGISTRY/tools/s3cmd:latest
+          command: ["s3cmd", "--config=/etc/s3cmd/s3cfg", "sync", "--no-preserve",
+                    "s3://models/zai-org/GLM-5.3/", "/models/GLM-5.3/"]
+          resources:
+            requests: {cpu: "4", memory: 8Gi}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: s3cfg, mountPath: /etc/s3cmd, readOnly: true}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: glm53-models}
+        - name: s3cfg
+          secret: {secretName: s3cmd-config}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: glm53-pull-b200-02
+  namespace: llm-glm53
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        kubernetes.io/hostname: b200-02
+      containers:
+        - name: pull
+          image: REGISTRY/tools/s3cmd:latest
+          command: ["s3cmd", "--config=/etc/s3cmd/s3cfg", "sync", "--no-preserve",
+                    "s3://models/zai-org/GLM-5.3/", "/models/GLM-5.3/"]
+          resources:
+            requests: {cpu: "4", memory: 8Gi}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: s3cfg, mountPath: /etc/s3cmd, readOnly: true}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: glm53-models}
+        - name: s3cfg
+          secret: {secretName: s3cmd-config}
+---
+# =============================================================================
+# LLMInferenceService (KServe v0.21, API v1alpha2)
+#
+# Merged on top of the well-known preset kserve-config-llm-template, which
+# already runs:  vllm serve /mnt/models --served-model-name <model.name> \
+#                publishers/<ns>/models/<model.name> --port 8000 ... "$@"
+#  -> do NOT pass --model, --port or --served-model-name here.
+#  -> the preset launches through `bash -c ... eval`, so keep every arg a single
+#     token (--flag=value, dotted keys). No JSON-valued args, no spaces.
+#  -> no spec.parallelism / spec.worker: single-node Deployment path. DP/EP are
+#     passed as vLLM args (the single-node preset only renders tensor size).
+# =============================================================================
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: glm53                     # InferencePool will be glm53-inference-pool
+  namespace: llm-glm53
+spec:
+  model:
+    # pvc://<claim>/<subpath>: mounted read-only at /mnt/models, and the
+    # controller strips the storage-initializer (no copy, no S3 access).
+    uri: pvc://glm53-models/GLM-5.3
+    name: glm-5.3                 # what clients send as "model"
+
+  replicas: 2                     # one full-node replica per B200
+
+  # Default Deployment strategy is 25%/25% -> maxSurge 1, maxUnavailable 0.
+  # The surge pod needs 8 free GPUs that don't exist -> rollout deadlocks.
+  rolloutStrategy:
+    maxSurge: 0
+    maxUnavailable: 1
+
+  router:
+    gateway: {}                   # kserve/kserve-ingress-gateway (pre-req 5)
+    route: {}                     # KServe-managed HTTPRoute on that Gateway
+    scheduler: {}                 # llm-d EPP + InferencePool (Agent Router targets it)
+    # Same layout as the KServe "LLMInferenceService + Envoy AI Gateway" guide:
+    # KServe's HTTPRoute lives on the KServe gateway, the AIGatewayRoute on the
+    # Agent Router gateway, both pointing at the same InferencePool.
+    #
+    # FALLBACK if kserve-ingress-gateway doesn't exist: give ai-gateway a 2nd
+    # listener (e.g. name: kserve, port: 8080) and use
+    #   gateway:
+    #     refs:
+    #       - {name: ai-gateway, namespace: ai-gateway, sectionName: kserve}
+    # and add `sectionName: http` to the AIGatewayRoute parentRef. Never put
+    # both routes on the SAME listener: KServe's path-specific HTTPRoute can
+    # win the match and bypass token metering / rate limits.
+
+  template:
+    terminationGracePeriodSeconds: 300   # KServe derives vLLM --shutdown-timeout=280s from this
+    tolerations: []                      # add your GPU-node taints here if any
+    containers:
+      - name: main
+        image: REGISTRY/llm-d-cuda:v0.9.0-vllm0.30.0
+        args:
+          # --- parallelism: DP8 x EP8 inside the node (MLA KV not replicated) ---
+          - --data-parallel-size=8
+          - --enable-expert-parallel
+          # vLLM 0.30 default, kept explicit. A/B candidates on NVLink:
+          # flashinfer_nvlink_one_sided, deepep_high_throughput
+          - --all2all-backend=allgather_reducescatter
+          # --- memory / KV ---
+          - --kv-cache-dtype=fp8_e4m3
+          - --gpu-memory-utilization=0.90
+          # one sequence must fit in ONE rank's KV pool; full 1M ctx = TP8 recipe
+          - --max-model-len=262144
+          - --max-num-seqs=64               # PER DP RANK -> 512 per node
+          - --max-num-batched-tokens=8192   # per rank
+          - --enable-prefix-caching
+          # --- GLM-5.3 recipe ---
+          # If engine init dies inside the MTP drafter under DP, drop these two
+          # lines first (MTP+DP broke on GLM-5.2 / vLLM 0.24 before).
+          - --speculative-config.method=mtp
+          - --speculative-config.num_speculative_tokens=5
+          - --reasoning-parser=glm47
+          - --tool-call-parser=glm47
+          - --enable-auto-tool-choice
+        env:
+          # air-gapped: never reach out to HF
+          - {name: HF_HUB_OFFLINE, value: "1"}
+          - {name: TRANSFORMERS_OFFLINE, value: "1"}
+          # DP engines wait for load + DeepGEMM warmup + graph capture
+          - {name: VLLM_ENGINE_READY_TIMEOUT_S, value: "3600"}
+          # persistent JIT caches (glm53-cache PV)
+          - {name: VLLM_CACHE_ROOT, value: /cache/vllm}
+          - {name: DG_JIT_CACHE_DIR, value: /cache/deep_gemm}
+          - {name: TRITON_CACHE_DIR, value: /cache/triton}
+          - {name: FLASHINFER_WORKSPACE_BASE, value: /cache/flashinfer}
+        resources:
+          requests:
+            cpu: "64"
+            memory: 512Gi
+            nvidia.com/gpu: "8"
+          limits:
+            memory: 1536Gi                # size to node RAM; page cache counts here
+            nvidia.com/gpu: "8"
+        # Preset startupProbe = 60 x 10s = 10 min: too short for a cold first
+        # boot (756 GB load + DeepGEMM JIT + torch.compile + MTP graph capture).
+        startupProbe:
+          failureThreshold: 180           # 30 min
+        livenessProbe:
+          timeoutSeconds: 5               # preset is 1s
+        readinessProbe:                   # preset is 1s timeout / 2 failures ->
+          timeoutSeconds: 5               # pod flaps out of the InferencePool
+          failureThreshold: 5             # when /health is slow under load
+        volumeMounts:
+          - {name: compile-cache, mountPath: /cache}
+    volumes:
+      - name: dshm                        # preset is 1Gi; 8 ranks need more
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      - name: compile-cache
+        persistentVolumeClaim:
+          claimName: glm53-cache
+---
+# =============================================================================
+# Agent Router 1.1: AIGatewayRoute -> KServe InferencePool
+#  - Only ONE InferencePool per rule; can't mix with AIServiceBackend in a rule.
+#  - Default request timeout is 60s -> kills long reasoning; set 1h.
+#  - Cross-namespace parentRef: the Gateway listener's allowedRoutes must
+#    admit namespace llm-glm53.
+# =============================================================================
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIGatewayRoute
+metadata:
+  name: glm53
+  namespace: llm-glm53
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: ai-gateway
+      namespace: ai-gateway
+  rules:
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model        # filled from the request body "model"
+              value: glm-5.3
+      backendRefs:
+        - group: inference.networking.k8s.io
+          kind: InferencePool
+          name: glm53-inference-pool     # confirm: oc get inferencepool -n llm-glm53
+      timeouts:
+        request: 3600s
+  llmRequestCosts:
+    - {metadataKey: llm_input_token, type: InputToken}
+    - {metadataKey: llm_output_token, type: OutputToken}
+    - {metadataKey: llm_reasoning_token, type: ReasoningToken}
+    - {metadataKey: llm_total_token, type: TotalToken}
+---
+# =============================================================================
+# POST-APPLY CHECKS
+#  oc get job -n llm-glm53                                   # both pulls Complete
+#  oc get llmisvc glm53 -n llm-glm53 -o wide                 # Ready=True
+#  oc get deploy -n llm-glm53 -l app.kubernetes.io/name=glm53 -o yaml \
+#    | yq '.items[0].spec.template.spec.containers[0] | {args, startupProbe, readinessProbe}'
+#      -> confirm the preset merge kept httpGet and applied your overrides
+#  oc get inferencepool -n llm-glm53                         # glm53-inference-pool
+#  oc get aigatewayroute glm53 -n llm-glm53 -o jsonpath='{.status.conditions}'
+#  oc logs -n llm-glm53 deploy/<name> | grep -E "KV cache size|Maximum concurrency"
+#      -> tune --max-num-seqs / --max-model-len from these numbers
+#  curl -s $AGENT_ROUTER_URL/v1/chat/completions -H 'content-type: application/json' \
+#    -d '{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}],
+#         "chat_template_kwargs":{"reasoning_effort":"low"}}'
+# =============================================================================

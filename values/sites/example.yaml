@@ -1,0 +1,54 @@
+# Per-cluster values. Copy to values/site.yaml and replace every value.
+
+global:
+  imageRegistry: REGISTRY            # internal registry host[/project]
+
+nodes:                               # kubernetes.io/hostname of each serving node
+  - b200-01
+  - b200-02
+
+tolerations: []                      # GPU-node taints, if any
+
+modelPull:
+  image:
+    repository: tools/s3cmd
+    tag: latest                      # pin this
+  source: s3://models/zai-org/GLM-5.3/
+  existingSecret: s3cmd-config       # secret with key s3cfg
+
+route:
+  gateway:                           # the Agent Router Gateway
+    name: ai-gateway
+    namespace: ai-gateway
+
+argocd:
+  enabled: true
+
+rateLimit:
+  enabled: true                      # needs the Envoy Gateway rate limit service + Redis
+  clientHeader: x-tenant-id
+  tokens: 2000000
+  unit: Hour
+
+healthRoute:
+  enabled: true                      # GSLB monitor: GET /healthz/glm-5.3
+
+benchmark:
+  enabled: true
+  image:
+    repository: tools/aiperf
+    tag: latest                      # pin this
+  url: https://llm.site1.example.internal   # this site's gateway, not the global name
+  apiKeySecret:
+    name: aiperf-api-key
+
+globalName:
+  enabled: true
+  fqdn: llm.example.internal         # the same on every site
+  hostRule:
+    namespace: envoy-gateway-system  # where the gateway's LoadBalancer Service lives
+    localFqdn: llm.site1.example.internal
+  gslbHostRule:
+    create: true                     # AMKO leader cluster only; false on the other sites
+    healthMonitorRefs:
+      - glm53-health                 # federated HTTPS monitor on Avi: GET /healthz/glm-5.3 -> 200

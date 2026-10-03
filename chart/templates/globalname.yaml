@@ -1,0 +1,69 @@
+{{- /*
+One global name in front of every site, through AKO + AMKO.
+
+HostRule (every cluster): maps this cluster's gateway FQDN to the global FQDN.
+AMKO, in custom global FQDN mode, groups all clusters that map to the same
+global FQDN into one GslbService.
+
+GSLBHostRule (AMKO leader cluster only): the per-name settings of that
+GslbService: health monitors, algorithm, TTL, per-site weights.
+
+Both describe the gateway, not the model, so only one release per cluster may
+create them. The GlobalDeploymentPolicy is a singleton per AMKO and is not
+created here; it must select the gateway's LoadBalancer Service.
+*/ -}}
+{{- if .Values.globalName.enabled }}
+{{- $fullname := include "kserve-llm.fullname" . -}}
+{{- $global := .Values.globalName -}}
+{{- $fqdn := required "globalName.fqdn is required" $global.fqdn -}}
+{{- if and .Values.benchmark.enabled (contains $fqdn .Values.benchmark.url) }}
+{{- fail (printf "benchmark.url %q uses the global name; it must be this site's own gateway" .Values.benchmark.url) }}
+{{- end }}
+{{- if $global.hostRule.create }}
+apiVersion: {{ $global.hostRule.apiVersion }}
+kind: HostRule
+metadata:
+  name: {{ $fullname }}-global-name
+  namespace: {{ required "globalName.hostRule.namespace is required (namespace of the gateway's LoadBalancer Service)" $global.hostRule.namespace }}
+  labels:
+    {{- include "kserve-llm.labels" . | nindent 4 }}
+  {{- with include "kserve-llm.annotations" (dict "root" . "wave" "route") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  virtualhost:
+    fqdn: {{ required "globalName.hostRule.localFqdn is required (the FQDN AKO gave the gateway Service on this cluster)" $global.hostRule.localFqdn }}
+    gslb:
+      fqdn: {{ $fqdn }}
+{{- end }}
+{{- if $global.gslbHostRule.create }}
+---
+apiVersion: {{ $global.gslbHostRule.apiVersion }}
+kind: GSLBHostRule
+metadata:
+  name: {{ $fullname }}-global-name
+  namespace: {{ $global.gslbHostRule.namespace }}
+  labels:
+    {{- include "kserve-llm.labels" . | nindent 4 }}
+  {{- with include "kserve-llm.annotations" (dict "root" . "wave" "route") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  fqdn: {{ $fqdn }}
+  ttl: {{ $global.gslbHostRule.ttl }}
+  {{- with $global.gslbHostRule.healthMonitorRefs }}
+  healthMonitorRefs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $global.gslbHostRule.poolAlgorithmSettings }}
+  poolAlgorithmSettings:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $global.gslbHostRule.trafficSplit }}
+  trafficSplit:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}
