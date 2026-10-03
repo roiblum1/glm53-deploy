@@ -12,6 +12,11 @@ Hugging Face; that also pins the pod to a serving node.
 {{- $bench := .Values.benchmark -}}
 {{- $image := include "kserve-llm.image" (dict "root" . "image" $bench.image "what" "benchmark.image") -}}
 {{- $url := required "benchmark.url is required (the site-local gateway URL, not the global name)" $bench.url -}}
+{{- $headers := deepCopy $bench.headers -}}
+{{- if .Values.crossSite.enabled }}
+{{- /* Tier 0 would spread the run over every site; pin it to this one. */ -}}
+{{- $_ := set $headers .Values.crossSite.pinHeader (include "kserve-llm.crossSite" . | fromYaml).self -}}
+{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -56,7 +61,7 @@ spec:
             - {name: TARGET_URL, value: {{ $url | quote }}}
             - {name: MODEL, value: {{ .Values.model.name | quote }}}
             - {name: READY_TIMEOUT_SECONDS, value: {{ $bench.readyTimeoutSeconds | quote }}}
-            - {name: EXTRA_HEADERS, value: {{ toJson $bench.headers | quote }}}
+            - {name: EXTRA_HEADERS, value: {{ toJson $headers | quote }}}
             {{- include "kserve-llm.benchmarkEnv" . | nindent 12 }}
       containers:
         - name: aiperf
@@ -82,7 +87,7 @@ spec:
             - --goodput
             - {{ . | quote }}
             {{- end }}
-            {{- range $name, $value := $bench.headers }}
+            {{- range $name, $value := $headers }}
             - --header
             - {{ printf "%s:%s" $name $value | quote }}
             {{- end }}

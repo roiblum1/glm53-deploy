@@ -258,6 +258,150 @@
           }
         }
       }
+    },
+    "crossSite": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "self": {
+          "type": "string"
+        },
+        "peerListener": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "sites": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "address",
+              "weight"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+              },
+              "address": {
+                "type": "string",
+                "minLength": 1
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "weight": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "hostname": {
+              "type": "string"
+            },
+            "caCertificateRef": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "ConfigMap",
+                    "Secret"
+                  ]
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            },
+            "clientCertificateSecret": {
+              "type": "string"
+            }
+          }
+        },
+        "pinHeader": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+$"
+        },
+        "retry": {
+          "type": "object",
+          "properties": {
+            "numRetries": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "baseInterval": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$"
+            },
+            "maxInterval": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$"
+            }
+          }
+        },
+        "healthCheck": {
+          "type": "object",
+          "properties": {
+            "interval": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$"
+            },
+            "timeout": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$"
+            },
+            "unhealthyThreshold": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "healthyThreshold": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "maxParallelRequests": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "serving": {
+          "type": "object",
+          "properties": {
+            "requestsPerNode": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "gatewayReplicas": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "maxPendingRequests": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
     }
   },
   "definitions": {

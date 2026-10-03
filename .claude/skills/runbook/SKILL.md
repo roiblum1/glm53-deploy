@@ -41,6 +41,7 @@ Commands only, with one short line of purpose and the expected result per step. 
 5. **Stage 2** — `oc apply -f 02-full.yaml`, then watch the llmisvc until `Ready=True`. Cold start can take up to the startupProbe budget in the render.
 6. **Verify** — InferencePool exists, AIGatewayRoute conditions, and the generated Deployment's args / startupProbe / readinessProbe via `-o jsonpath` (confirms the preset merge kept `httpGet` and applied the overrides).
 7. **Rate limit and health route** — if rendered: `oc get backendtrafficpolicy` conditions, and `curl` the health path on the site-local gateway.
+7b. **Cross-site** — if `<release>-sites` is rendered: check the peer listener and certificates exist (README "Cross-site pooling" pre-reqs), the tier-0 route and both policies are Accepted, the Envoy `/clusters` check from the README, then one pinned `curl` per site (`x-site-pin`).
 8. **Smoke test** — `curl` chat-completions with the model name from the render; leave `AGENT_ROUTER_URL` for the user to set.
 9. **Tuning** — the `KV cache size|Maximum concurrency` log grep and which values to adjust from it.
 10. **Changes and rollback** — a serving change takes one node down per rollout step; a changed pull Job renders under a new name, so delete the old Job by hand when applying with `oc`; PVs are `Retain`, so deleting PVCs leaves PVs `Released` and host data in place.
