@@ -43,6 +43,8 @@ benchmark:
   apiKeySecret:
     name: aiperf-api-key
 
+# Read by the fleet release (fleet/), not the model chart: the global name
+# describes the gateway.
 globalName:
   enabled: true
   fqdn: llm.example.internal         # the same on every site
@@ -52,21 +54,18 @@ globalName:
   gslbHostRule:
     create: true                     # AMKO leader cluster only; false on the other sites
     healthMonitorRefs:
-      - glm53-health                 # federated HTTPS monitor on Avi: GET /healthz/glm-5.3 -> 200
-    poolAlgorithmSettings:           # with crossSite, affinity is not DNS's job: spread entry
-      lbAlgorithm: GSLB_ALGORITHM_ROUND_ROBIN
+      - fleet-gateway-health         # federated HTTPS monitor on Avi: GET /healthz/gateway -> 200
 
-# Tier 0: this gateway spreads requests over every site below. Needs the peer
-# listener, its certificate and the client certificate (README "Multiple sites").
+# Cross-site. Read by both charts: the model chart puts its serving route on
+# peerListener and pins its benchmark to `self`; the fleet chart dials every
+# site's peerListener with this client certificate. Needs the peer listener and
+# certificates (fleet/README.md, pre-reqs).
 crossSite:
-  enabled: true
-  self: site1
+  enabled: true                      # model chart: serve this model to the fleet
+  self: site1                        # this site's name in values/fleet.yaml
   peerListener: peers                # mTLS listener on route.gateway for other sites
-  sites:                             # identical on every site; weight = node count
-    - {name: site1, address: llm.site1.example.internal, weight: 2}
-    - {name: site2, address: llm.site2.example.internal, weight: 2}
   tls:
     caCertificateRef: {kind: ConfigMap, name: llm-peer-ca}
     clientCertificateSecret: llm-peer-client
   serving:
-    gatewayReplicas: 2               # Envoy replicas of ai-gateway on this cluster
+    gatewayReplicas: 2               # Envoy replicas of ai-gateway on this cluster (fixed)
